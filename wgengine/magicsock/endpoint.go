@@ -523,6 +523,9 @@ func (de *endpoint) initFakeUDPAddr() {
 // Conn.noteRecvActivity no more than once every 10s, returning true if it
 // was called, otherwise false.
 func (de *endpoint) noteRecvActivity(src epAddr, now mono.Time) bool {
+	// Any packet from this peer is proof of reachability.
+	de.c.NoteExitNodeReachabilityResult(de.publicKey, nil)
+
 	if de.isWireguardOnly {
 		de.mu.Lock()
 		de.bestAddr.ap = src.ap
@@ -1081,6 +1084,7 @@ func (de *endpoint) send(buffs [][]byte, offset int) error {
 		if rid := de.c.fallbackDERPRegionForPeer(de.publicKey); rid != 0 {
 			derpAddr = netip.AddrPortFrom(tailcfg.DerpMagicIPAddr, uint16(rid))
 		} else {
+			de.c.NoteExitNodeReachabilityResult(de.publicKey, errNoUDPOrDERP)
 			return errNoUDPOrDERP
 		}
 	}
@@ -1144,6 +1148,9 @@ func (de *endpoint) send(buffs [][]byte, offset int) error {
 		if allOk {
 			return nil
 		}
+	}
+	if err != nil {
+		de.c.NoteExitNodeReachabilityResult(de.publicKey, err)
 	}
 	return err
 }
