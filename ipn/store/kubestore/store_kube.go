@@ -47,6 +47,11 @@ const (
 
 	keyTLSCert = "tls.crt"
 	keyTLSKey  = "tls.key"
+
+	// acmeAccountStateKey is the ipn.StateStore key under which tailscaled
+	// stores its ACME account private key. Mirrors the acmePEMName constant
+	// in ipn/ipnlocal/cert.go. Duplicated here to avoid an import cycle.
+	acmeAccountStateKey = "acme-account.key.pem"
 )
 
 // Store is an ipn.StateStore that uses a Kubernetes Secret for persistence.
@@ -56,6 +61,12 @@ type Store struct {
 	secretName    string // state Secret
 	certShareMode string // 'ro', 'rw', or empty
 	podName       string
+
+	// acmeAccountsSecretName, when non-empty in "rw" cert share mode,
+	// routes reads and writes of acmeAccountStateKey to acmeAccountField
+	// inside this shared per-tailnet Secret. See #18251.
+	acmeAccountsSecretName string
+	acmeAccountField       string
 
 	logf logger.Logf
 
@@ -106,6 +117,17 @@ func newWithClient(logf logger.Logf, c kubeclient.Client, secretName string) (*S
 		s.certShareMode = "ro"
 	}
 
+	// Configure shared ACME account lookup. Only meaningful for the cert
+	// issuer (cert share "rw") — read replicas never issue.
+	if s.certShareMode == "rw" {
+		s.acmeAccountsSecretName = os.Getenv("TS_ACME_ACCOUNT_SECRET_NAME")
+		s.acmeAccountField = os.Getenv("TS_ACME_ACCOUNT_FIELD")
+		if s.acmeAccountsSecretName != "" && s.acmeAccountField == "" {
+			s.logf("[unexpected] TS_ACME_ACCOUNT_SECRET_NAME set without TS_ACME_ACCOUNT_FIELD; ignoring shared ACME account configuration")
+			s.acmeAccountsSecretName = ""
+		}
+	}
+
 	// Load latest state from kube Secret if it already exists.
 	if err := s.loadState(); err != nil && err != ipn.ErrStateNotExist {
 		return nil, fmt.Errorf("error loading state from kube Secret: %w", err)
@@ -126,7 +148,57 @@ func newWithClient(logf logger.Logf, c kubeclient.Client, secretName string) (*S
 	if s.certShareMode == "ro" {
 		go s.runCertReload(context.Background())
 	}
+	if s.acmeAccountsSecretName != "" {
+		if err := s.reconcileSharedACMEAccountKey(); err != nil {
+			// Non-fatal: the cert loop will retry on next issuance.
+			s.logf("kubestore: reconciling shared ACME account key: %v", err)
+		}
+	}
 	return s, nil
+}
+
+// reconcileSharedACMEAccountKey aligns the in-memory ACME account key with
+// the shared per-tailnet field: adopt the shared value if present, otherwise
+// copy the local per-pod key up so upgrading deployments keep renewal
+// continuity.
+func (s *Store) reconcileSharedACMEAccountKey() error {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	sharedSecret, err := s.client.GetSecret(ctx, s.acmeAccountsSecretName)
+	if err != nil && !kubeclient.IsNotFoundErr(err) {
+		return fmt.Errorf("reading shared ACME accounts Secret %q: %w", s.acmeAccountsSecretName, err)
+	}
+	var sharedKey []byte
+	if sharedSecret != nil {
+		sharedKey = sharedSecret.Data[sanitizeKey(s.acmeAccountField)]
+	}
+	if len(sharedKey) > 0 {
+		// Shared field already populated for this tailnet. Adopt it.
+		s.memory.WriteState(ipn.StateKey(acmeAccountStateKey), sharedKey)
+		return nil
+	}
+
+	// Shared field is empty. If we have a per-pod key from the state
+	// Secret, copy it up so existing renewals stay exempt.
+	localKey, err := s.memory.ReadState(ipn.StateKey(acmeAccountStateKey))
+	if err != nil || len(localKey) == 0 {
+		// Nothing local either; the cert loop will generate one on first
+		// use and route the write through writeSharedACMEAccountKey.
+		return nil
+	}
+	if err := s.writeSharedACMEAccountKey(localKey); err != nil {
+		return fmt.Errorf("copying per-pod ACME account key to shared Secret: %w", err)
+	}
+	s.logf("kubestore: migrated per-pod ACME account key into shared Secret %q field %q", s.acmeAccountsSecretName, s.acmeAccountField)
+	return nil
+}
+
+// writeSharedACMEAccountKey writes key to acmeAccountField inside
+// acmeAccountsSecretName, using whichever access pattern (patch or update)
+// this Store has permission for.
+func (s *Store) writeSharedACMEAccountKey(key []byte) error {
+	return s.updateSecret(map[string][]byte{s.acmeAccountField: key}, s.acmeAccountsSecretName)
 }
 
 func (s *Store) SetDialer(d func(ctx context.Context, network, address string) (net.Conn, error)) {
@@ -147,6 +219,12 @@ func (s *Store) WriteState(id ipn.StateKey, bs []byte) (err error) {
 			s.memory.WriteState(ipn.StateKey(sanitizeKey(id)), bs)
 		}
 	}()
+	if s.acmeAccountsSecretName != "" && string(id) == acmeAccountStateKey {
+		if bs == nil {
+			return s.removeSecretField(s.acmeAccountField, s.acmeAccountsSecretName)
+		}
+		return s.writeSharedACMEAccountKey(bs)
+	}
 	if bs == nil {
 		return s.removeSecretField(string(id), s.secretName)
 	}
@@ -489,7 +567,9 @@ func (s *Store) loadCerts(ctx context.Context, sel map[string]string) error {
 // canCreateSecret returns true if this node should be allowed to create the given
 // Secret in its namespace.
 func (s *Store) canCreateSecret(secret string) bool {
-	// Only allow creating the state Secret (and not TLS Secrets).
+	// Only allow creating the state Secret (and not TLS Secrets). The
+	// shared ACME accounts Secret is precreated by the operator, so write
+	// replicas never need create permission for it.
 	return secret == s.secretName
 }
 
@@ -498,7 +578,8 @@ func (s *Store) canCreateSecret(secret string) bool {
 func (s *Store) canPatchSecret(secret string) bool {
 	// For backwards compatibility reasons, setups where the proxies are not
 	// given PATCH permissions for state Secrets are allowed. For TLS
-	// Secrets, we should always have PATCH permissions.
+	// Secrets and the shared ACME accounts Secret, we should always have
+	// PATCH permissions.
 	if secret == s.secretName {
 		return s.canPatch
 	}
