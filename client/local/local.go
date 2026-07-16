@@ -923,6 +923,25 @@ func (lc *Client) EditPrefs(ctx context.Context, mp *ipn.MaskedPrefs) (*ipn.Pref
 	return decodeJSON[*ipn.Prefs](body)
 }
 
+// GetServicePrefs returns all of the current profile's [ipn.ServicePrefs].
+func (lc *Client) GetServicePrefs(ctx context.Context) (ipn.ServicePrefs, error) {
+	body, err := lc.get200(ctx, "/localapi/v0/prefs/service-prefs")
+	if err != nil {
+		return nil, err
+	}
+	return decodeJSON[ipn.ServicePrefs](body)
+}
+
+// SetServicePref merges the non-empty fields from an [apitype.ServicePrefRequest] into the
+// saved service prefs for the current profile and returns the full updated set.
+func (lc *Client) SetServicePref(ctx context.Context, req apitype.ServicePrefRequest) (ipn.ServicePrefs, error) {
+	body, err := lc.send(ctx, "POST", "/localapi/v0/prefs/service-prefs", http.StatusOK, jsonBody(req))
+	if err != nil {
+		return nil, err
+	}
+	return decodeJSON[ipn.ServicePrefs](body)
+}
+
 // GetDNSOSConfig returns the system DNS configuration for the current device.
 // That is, it returns the DNS configuration that the system would use if Tailscale weren't being used.
 func (lc *Client) GetDNSOSConfig(ctx context.Context) (*apitype.DNSOSConfig, error) {

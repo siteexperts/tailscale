@@ -70,6 +70,7 @@ type LocalAPIHandler func(*Handler, http.ResponseWriter, *http.Request)
 // then it's a prefix match.
 var handler = map[string]LocalAPIHandler{
 	// The prefix match handlers end with a slash:
+	"prefs/":    (*Handler).serveNamespacedPrefs, // match /prefs/ and /prefs/<namespace>
 	"profiles/": (*Handler).serveProfiles,
 
 	// The other /localapi/v0/NAME handlers are exact matches and contain only NAME

@@ -380,6 +380,15 @@ type LocalBackend struct {
 	serveConfig       ipn.ServeConfigView      // or !Valid if none
 	ipVIPServiceMap   netmap.IPServiceMappings // map of VIPService IPs to their corresponding service names; TODO(nickkhyl): move to nodeBackend
 
+	// namespacedPrefsStores caches the per-namespace [ipn.StateStore] backing the
+	// /prefs/{namespace} LocalAPI, keyed by "<profileID>/<namespace>". Guarded by mu.
+	namespacedPrefsStores map[string]ipn.StateStore
+
+	// servicePrefsWriteMu ensures only one [LocalBackend.SetServicePref] runs at a time so
+	// concurrent writes don't lose each other's updates. It's separate from mu because the
+	// update reads and writes a file, and holding mu across that would block the backend.
+	servicePrefsWriteMu sync.Mutex
+
 	webClient          webClient
 	webClientListeners map[netip.AddrPort]*localListener // listeners for local web client traffic
 
@@ -8369,6 +8378,7 @@ func (b *LocalBackend) DeleteProfile(p ipn.ProfileID) error {
 			b.logf("warning: removing profile data for %q: %v", p, err)
 		}
 	}
+	b.evictNamespacedPrefsStoresLocked(p)
 	if !needToRestart {
 		return nil
 	}
@@ -8425,7 +8435,8 @@ func (b *LocalBackend) ResetAuth() error {
 	if err := b.pm.DeleteAllProfilesForUser(); err != nil {
 		return err
 	}
-	b.resetDialPlan() // always reset if we're removing everything
+	b.evictNamespacedPrefsStoresLocked("") // empty ID evicts cached stores for all profiles
+	b.resetDialPlan()                      // always reset if we're removing everything
 	return b.resetForProfileChangeLocked()
 }
 
