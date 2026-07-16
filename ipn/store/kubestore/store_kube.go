@@ -5,7 +5,9 @@
 package kubestore
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -47,6 +49,12 @@ const (
 
 	keyTLSCert = "tls.crt"
 	keyTLSKey  = "tls.key"
+	// keyACMEAcctFP is the cert Secret field that records the SHA-256
+	// fingerprint of the PEM-encoded ACME account key that issued the
+	// cert. The renewal path uses this to decide whether to include the
+	// ARI "replaces" hint: only if the current account key matches
+	// (otherwise Let's Encrypt rejects the claim).
+	keyACMEAcctFP = "acme-account-fingerprint"
 
 	// acmeAccountStateKey is the ipn.StateStore key under which tailscaled
 	// stores its ACME account private key. Mirrors the acmePEMName constant
@@ -67,6 +75,11 @@ type Store struct {
 	// inside this shared per-tailnet Secret. See #18251.
 	acmeAccountsSecretName string
 	acmeAccountField       string
+
+	// preAdoptedLocalKey is the SHA-256 of the per-pod ACME account key
+	// that was in the local state Secret before we adopted a foreign
+	// shared key. Non-nil only when adoption changed the key.
+	preAdoptedLocalKey []byte
 
 	logf logger.Logf
 
@@ -174,7 +187,15 @@ func (s *Store) reconcileSharedACMEAccountKey() error {
 		sharedKey = sharedSecret.Data[sanitizeKey(s.acmeAccountField)]
 	}
 	if len(sharedKey) > 0 {
-		// Shared field already populated for this tailnet. Adopt it.
+		// Shared field already populated for this tailnet. Adopt it. If
+		// our local per-pod key differs, remember its fingerprint so
+		// legacy certs on this pod (issued before we started stamping
+		// fingerprints) can be recognised as mis-aligned on renewal.
+		localKey, err := s.memory.ReadState(ipn.StateKey(acmeAccountStateKey))
+		if err == nil && len(localKey) > 0 && !bytes.Equal(localKey, sharedKey) {
+			sum := sha256.Sum256(localKey)
+			s.preAdoptedLocalKey = sum[:]
+		}
 		s.memory.WriteState(ipn.StateKey(acmeAccountStateKey), sharedKey)
 		return nil
 	}
@@ -199,6 +220,49 @@ func (s *Store) reconcileSharedACMEAccountKey() error {
 // this Store has permission for.
 func (s *Store) writeSharedACMEAccountKey(key []byte) error {
 	return s.updateSecret(map[string][]byte{s.acmeAccountField: key}, s.acmeAccountsSecretName)
+}
+
+// acmeAccountKeyFingerprint returns the SHA-256 of the current in-memory
+// PEM-encoded ACME account key, or (nil, false) if the key isn't set.
+func acmeAccountKeyFingerprint(m *mem.Store) ([]byte, bool) {
+	key, err := m.ReadState(ipn.StateKey(acmeAccountStateKey))
+	if err != nil || len(key) == 0 {
+		return nil, false
+	}
+	sum := sha256.Sum256(key)
+	return sum[:], true
+}
+
+// ShouldUseARIReplacesForRenewal reports whether the current ACME account
+// key matches the one that issued the cert for domain. See #18251.
+func (s *Store) ShouldUseARIReplacesForRenewal(domain string) (bool, error) {
+	if s.certShareMode != "rw" {
+		return true, nil
+	}
+	curFP, ok := acmeAccountKeyFingerprint(&s.memory)
+	if !ok {
+		// No current account key in memory yet; nothing to compare.
+		return true, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	sec, err := s.client.GetSecret(ctx, domain)
+	if err != nil {
+		if kubeclient.IsNotFoundErr(err) {
+			return true, nil
+		}
+		return true, fmt.Errorf("getting TLS Secret %q: %w", domain, err)
+	}
+	certFP := sec.Data[keyACMEAcctFP]
+	if len(certFP) == 0 {
+		// Legacy cert, no fingerprint stamp. Assume misaligned only if
+		// we adopted a foreign shared key.
+		if len(s.preAdoptedLocalKey) > 0 {
+			return false, nil
+		}
+		return true, nil
+	}
+	return bytes.Equal(certFP, curFP), nil
 }
 
 func (s *Store) SetDialer(d func(ctx context.Context, network, address string) (net.Conn, error)) {
@@ -232,7 +296,9 @@ func (s *Store) WriteState(id ipn.StateKey, bs []byte) (err error) {
 }
 
 // WriteTLSCertAndKey writes a TLS cert and key to domain.crt, domain.key fields
-// of a Tailscale Kubernetes node's state Secret.
+// of a Tailscale Kubernetes node's state Secret. In cert-share "rw" mode it
+// also stamps acme-account-fingerprint alongside the cert so the renewal path
+// can tell whether the current ACME account key issued this cert.
 func (s *Store) WriteTLSCertAndKey(domain string, cert, key []byte) (err error) {
 	if s.certShareMode == "ro" {
 		s.logf("[unexpected] TLS cert and key write in read-only mode")
@@ -252,6 +318,9 @@ func (s *Store) WriteTLSCertAndKey(domain string, cert, key []byte) (err error) 
 		data = map[string][]byte{
 			keyTLSCert: cert,
 			keyTLSKey:  key,
+		}
+		if fp, ok := acmeAccountKeyFingerprint(&s.memory); ok {
+			data[keyACMEAcctFP] = fp
 		}
 	}
 	if err := s.updateSecret(data, secretName); err != nil {

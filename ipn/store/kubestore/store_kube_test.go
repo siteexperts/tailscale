@@ -6,6 +6,7 @@ package kubestore
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -868,15 +869,16 @@ func TestSharedACMEAccountKey(t *testing.T) {
 		wantMemoryACME   []byte
 		wantSharedSecret map[string][]byte
 		wantStateSecret  map[string][]byte // optional: when set, asserts state Secret was not touched on the ACME path
+		wantPreAdopted   []byte            // expected s.preAdoptedLocalKey (sha256 of pre-adoption local key)
 	}{
 		{
-			name:          "adopts_shared_key_when_present",
-			certMode:      "rw",
-			envSecretName: sharedSecretName,
-			envField:      sharedField,
-			stateSecret:   map[string][]byte{},
-			sharedSecret:  map[string][]byte{sharedField: existingKey},
-			wantMemoryACME: existingKey,
+			name:             "adopts_shared_key_when_present",
+			certMode:         "rw",
+			envSecretName:    sharedSecretName,
+			envField:         sharedField,
+			stateSecret:      map[string][]byte{},
+			sharedSecret:     map[string][]byte{sharedField: existingKey},
+			wantMemoryACME:   existingKey,
 			wantSharedSecret: map[string][]byte{sharedField: existingKey},
 		},
 		{
@@ -886,6 +888,19 @@ func TestSharedACMEAccountKey(t *testing.T) {
 			envField:      sharedField,
 			stateSecret: map[string][]byte{
 				acmeAccountStateKey: freshKey, // would be stale
+			},
+			sharedSecret:     map[string][]byte{sharedField: existingKey},
+			wantMemoryACME:   existingKey,
+			wantSharedSecret: map[string][]byte{sharedField: existingKey},
+			wantPreAdopted:   sha256Sum(freshKey),
+		},
+		{
+			name:          "adopting_matching_local_leaves_preadopted_nil",
+			certMode:      "rw",
+			envSecretName: sharedSecretName,
+			envField:      sharedField,
+			stateSecret: map[string][]byte{
+				acmeAccountStateKey: existingKey, // matches shared
 			},
 			sharedSecret:     map[string][]byte{sharedField: existingKey},
 			wantMemoryACME:   existingKey,
@@ -925,26 +940,26 @@ func TestSharedACMEAccountKey(t *testing.T) {
 			wantMemoryACME: freshKey, // per-pod copy stays; shared Secret never consulted
 		},
 		{
-			name:           "write_routes_to_shared_secret",
-			certMode:       "rw",
-			envSecretName:  sharedSecretName,
-			envField:       sharedField,
-			stateSecret:    map[string][]byte{},
-			sharedSecret:   map[string][]byte{},
-			writeAfterInit: freshKey,
-			wantMemoryACME: freshKey,
+			name:             "write_routes_to_shared_secret",
+			certMode:         "rw",
+			envSecretName:    sharedSecretName,
+			envField:         sharedField,
+			stateSecret:      map[string][]byte{},
+			sharedSecret:     map[string][]byte{},
+			writeAfterInit:   freshKey,
+			wantMemoryACME:   freshKey,
 			wantSharedSecret: map[string][]byte{sharedField: freshKey},
 			wantStateSecret:  map[string][]byte{}, // state Secret untouched by the ACME write
 		},
 		{
-			name:           "write_in_ro_mode_goes_to_state_secret",
-			certMode:       "ro",
-			envSecretName:  sharedSecretName,
-			envField:       sharedField,
-			stateSecret:    map[string][]byte{},
-			sharedSecret:   map[string][]byte{},
-			writeAfterInit: freshKey,
-			wantMemoryACME: freshKey,
+			name:             "write_in_ro_mode_goes_to_state_secret",
+			certMode:         "ro",
+			envSecretName:    sharedSecretName,
+			envField:         sharedField,
+			stateSecret:      map[string][]byte{},
+			sharedSecret:     map[string][]byte{},
+			writeAfterInit:   freshKey,
+			wantMemoryACME:   freshKey,
 			wantSharedSecret: map[string][]byte{}, // env vars ignored in ro mode
 			wantStateSecret:  map[string][]byte{acmeAccountStateKey: freshKey},
 		},
@@ -1060,6 +1075,9 @@ func TestSharedACMEAccountKey(t *testing.T) {
 					t.Errorf("state Secret contents mismatch (-got +want):\n%s", diff)
 				}
 			}
+			if !bytes.Equal(s.preAdoptedLocalKey, tt.wantPreAdopted) {
+				t.Errorf("preAdoptedLocalKey = %x, want %x", s.preAdoptedLocalKey, tt.wantPreAdopted)
+			}
 		})
 	}
 }
@@ -1073,4 +1091,198 @@ func cloneMap(m map[string][]byte) map[string][]byte {
 		out[k] = append([]byte(nil), v...)
 	}
 	return out
+}
+
+func sha256Sum(b []byte) []byte {
+	sum := sha256.Sum256(b)
+	return sum[:]
+}
+
+func TestShouldUseARIReplacesForRenewal(t *testing.T) {
+	const domain = "app.tailnetxyz.ts.net"
+	acmeKey := []byte("-----BEGIN PRIVATE KEY-----\ncurrent\n-----END PRIVATE KEY-----")
+	otherKey := []byte("-----BEGIN PRIVATE KEY-----\nother\n-----END PRIVATE KEY-----")
+	curFP := sha256Sum(acmeKey)
+	otherFP := sha256Sum(otherKey)
+
+	tests := []struct {
+		name          string
+		certShareMode string
+		acmeInMemory  []byte // per-pod ACME key present in memory
+		preAdopted    []byte // sha256 of pre-adoption local key (foreign-key path)
+		certSecret    map[string][]byte
+		certGetErr    error
+		want          bool
+		wantErr       bool
+	}{
+		{
+			name:          "non_rw_mode_returns_true",
+			certShareMode: "",
+			want:          true,
+		},
+		{
+			name:          "ro_mode_returns_true",
+			certShareMode: "ro",
+			want:          true,
+		},
+		{
+			name:          "no_acme_key_returns_true",
+			certShareMode: "rw",
+			want:          true,
+		},
+		{
+			name:          "cert_not_found_returns_true",
+			certShareMode: "rw",
+			acmeInMemory:  acmeKey,
+			certGetErr:    &kubeapi.Status{Code: 404},
+			want:          true,
+		},
+		{
+			name:          "cert_get_error_returns_true_with_err",
+			certShareMode: "rw",
+			acmeInMemory:  acmeKey,
+			certGetErr:    fmt.Errorf("api down"),
+			want:          true,
+			wantErr:       true,
+		},
+		{
+			name:          "fingerprint_matches",
+			certShareMode: "rw",
+			acmeInMemory:  acmeKey,
+			certSecret:    map[string][]byte{keyACMEAcctFP: curFP},
+			want:          true,
+		},
+		{
+			name:          "fingerprint_differs",
+			certShareMode: "rw",
+			acmeInMemory:  acmeKey,
+			certSecret:    map[string][]byte{keyACMEAcctFP: otherFP},
+			want:          false,
+		},
+		{
+			name:          "legacy_cert_no_preadopted_returns_true",
+			certShareMode: "rw",
+			acmeInMemory:  acmeKey,
+			certSecret:    map[string][]byte{}, // no fingerprint field
+			want:          true,
+		},
+		{
+			name:          "legacy_cert_with_preadopted_returns_false",
+			certShareMode: "rw",
+			acmeInMemory:  acmeKey,
+			preAdopted:    sha256Sum(otherKey),
+			certSecret:    map[string][]byte{}, // no fingerprint field
+			want:          false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := &kubeclient.FakeClient{
+				GetSecretImpl: func(ctx context.Context, name string) (*kubeapi.Secret, error) {
+					if tt.certGetErr != nil {
+						return nil, tt.certGetErr
+					}
+					return &kubeapi.Secret{Data: tt.certSecret}, nil
+				},
+			}
+			s := &Store{
+				client:             client,
+				certShareMode:      tt.certShareMode,
+				memory:             mem.Store{},
+				preAdoptedLocalKey: tt.preAdopted,
+				logf:               t.Logf,
+			}
+			if len(tt.acmeInMemory) > 0 {
+				s.memory.WriteState(ipn.StateKey(acmeAccountStateKey), tt.acmeInMemory)
+			}
+
+			got, err := s.ShouldUseARIReplacesForRenewal(domain)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("err = %v, wantErr = %v", err, tt.wantErr)
+			}
+			if got != tt.want {
+				t.Errorf("got %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestWriteTLSCertAndKeyStampsFingerprint(t *testing.T) {
+	const domain = "app.tailnetxyz.ts.net"
+	acmeKey := []byte("-----BEGIN PRIVATE KEY-----\naccount\n-----END PRIVATE KEY-----")
+	wantFP := sha256Sum(acmeKey)
+
+	tests := []struct {
+		name         string
+		certMode     string
+		acmeInMemory []byte
+		wantFP       []byte // expected value of keyACMEAcctFP field; nil means field must be absent
+	}{
+		{
+			name:         "rw_mode_with_acme_key_stamps_fingerprint",
+			certMode:     "rw",
+			acmeInMemory: acmeKey,
+			wantFP:       wantFP,
+		},
+		{
+			name:     "rw_mode_no_acme_key_no_stamp",
+			certMode: "rw",
+		},
+		{
+			name:         "non_share_mode_no_stamp",
+			certMode:     "",
+			acmeInMemory: acmeKey,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			secret := map[string][]byte{}
+			client := &kubeclient.FakeClient{
+				GetSecretImpl: func(ctx context.Context, name string) (*kubeapi.Secret, error) {
+					return &kubeapi.Secret{Data: secret}, nil
+				},
+				CheckSecretPermissionsImpl: func(ctx context.Context, name string) (bool, bool, error) {
+					return true, true, nil
+				},
+				JSONPatchResourceImpl: func(ctx context.Context, name, resourceType string, patches []kubeclient.JSONPatch) error {
+					for _, p := range patches {
+						if p.Op == "add" && p.Path == "/data" {
+							secret = p.Value.(map[string][]byte)
+						} else if p.Op == "add" && strings.HasPrefix(p.Path, "/data/") {
+							secret[strings.TrimPrefix(p.Path, "/data/")] = p.Value.([]byte)
+						}
+					}
+					return nil
+				},
+			}
+			s := &Store{
+				client:        client,
+				canPatch:      true,
+				secretName:    "ts-state",
+				certShareMode: tt.certMode,
+				memory:        mem.Store{},
+				logf:          t.Logf,
+			}
+			if len(tt.acmeInMemory) > 0 {
+				s.memory.WriteState(ipn.StateKey(acmeAccountStateKey), tt.acmeInMemory)
+			}
+
+			if err := s.WriteTLSCertAndKey(domain, []byte("cert"), []byte("key")); err != nil {
+				t.Fatalf("WriteTLSCertAndKey: %v", err)
+			}
+
+			gotFP, present := secret[keyACMEAcctFP]
+			if tt.wantFP == nil {
+				if present {
+					t.Errorf("unexpected fingerprint stamped: %x", gotFP)
+				}
+				return
+			}
+			if !bytes.Equal(gotFP, tt.wantFP) {
+				t.Errorf("fingerprint = %x, want %x", gotFP, tt.wantFP)
+			}
+		})
+	}
 }
