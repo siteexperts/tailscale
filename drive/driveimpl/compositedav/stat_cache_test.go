@@ -211,3 +211,43 @@ func TestParentChildRelationship(t *testing.T) {
 		})
 	}
 }
+
+// TestUnicodeNormalizationInsensitivity verifies that cache lookups treat
+// canonically equivalent names as the same key. A parent directory listing
+// caches children under the names from the server's hrefs (often NFC), while
+// macOS WebDAV clients request the same files using NFD names. Without
+// normalization, the depth 0 lookup would miss and get would wrongly infer
+// notFound from the cached parent.
+func TestUnicodeNormalizationInsensitivity(t *testing.T) {
+	// Make sure we don't leak goroutines
+	tstest.ResourceCheck(t)
+
+	c := &StatCache{TTL: 24 * time.Hour} // don't expire
+	defer c.stop()
+
+	nfcParentPath := "/\u30ae\u30bf\u30fc"                          // /ギター, precomposed
+	nfdParentPath := "/\u30ad\u3099\u30bf\u30fc"                    // same name, decomposed
+	nfcChildPath := nfcParentPath + "/\u30c6\u30ba\u30c8.wav"       // テズト.wav, precomposed
+	nfdChildPath := nfdParentPath + "/\u30c6\u30b9\u3099\u30c8.wav" // same name, decomposed
+
+	unicodeParentResponse := strings.ReplaceAll(parentResponse, "/parent%20with%20spaces/", "/%E3%82%AE%E3%82%BF%E3%83%BC/")
+	unicodeChildResponse := strings.ReplaceAll(childResponse, "/parent%20with%20spaces/child.txt", "/%E3%82%AE%E3%82%BF%E3%83%BC/%E3%83%86%E3%82%BA%E3%83%88.wav")
+	unicodeFullParent := []byte(
+		strings.ReplaceAll(
+			fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?><D:multistatus xmlns:D="DAV:">%s%s</D:multistatus>`, unicodeParentResponse, unicodeChildResponse),
+			"\n", ""))
+	unicodeFullChild := []byte(
+		strings.ReplaceAll(
+			fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?><D:multistatus xmlns:D="DAV:">%s</D:multistatus>`, unicodeChildResponse),
+			"\n", ""))
+
+	c.set(nfcParentPath, 1, newCacheEntry(http.StatusMultiStatus, unicodeFullParent))
+
+	want := newCacheEntry(http.StatusMultiStatus, unicodeFullChild)
+	for _, childPath := range []string{nfcChildPath, nfdChildPath} {
+		got := c.get(childPath, 0)
+		if diff := cmp.Diff(got, want); diff != "" {
+			t.Errorf("get(%q): unexpected cached value; (-got+want):%v", childPath, diff)
+		}
+	}
+}
