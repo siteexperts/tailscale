@@ -91,6 +91,9 @@ func TestSendRecv(t *testing.T) {
 		if err := c.Connect(context.Background()); err != nil {
 			t.Fatalf("client %d Connect: %v", i, err)
 		}
+		if generation, connected := c.ConnectionGeneration(); !connected || generation == 0 {
+			t.Fatalf("client %d connection generation = (%d, connected=%v), want live nonzero generation", i, generation, connected)
+		}
 		waitConnect(t, c)
 		clients = append(clients, c)
 		recvChs = append(recvChs, make(chan []byte))

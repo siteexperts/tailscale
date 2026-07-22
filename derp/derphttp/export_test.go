@@ -19,6 +19,7 @@ func (c *Client) BreakConnection(brokenClient *Client) {
 		c.netConn = nil
 	}
 	c.client = nil
+	c.atomicState.Store(ConnectedState{Closed: c.closed, Generation: c.connGen})
 }
 
 var RetryInterval = &retryInterval

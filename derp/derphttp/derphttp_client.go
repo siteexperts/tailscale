@@ -437,6 +437,12 @@ func (c *Client) connect(ctx context.Context, caller string) (client *derp.Clien
 		c.client = derpClient
 		c.netConn = conn
 		c.connGen++
+		localAddr, _ := c.client.LocalAddr()
+		c.atomicState.Store(ConnectedState{
+			Connected:  true,
+			Generation: c.connGen,
+			LocalAddr:  localAddr,
+		})
 		return c.client, c.connGen, nil
 	case c.url != nil:
 		c.logf("%s: connecting to %v", caller, c.url)
@@ -1175,7 +1181,7 @@ func (c *Client) closeForReconnect(brokenClient *derp.Client) {
 		c.netConn = nil
 	}
 	c.client = nil
-	c.atomicState.Store(ConnectedState{Generation: c.connGen})
+	c.atomicState.Store(ConnectedState{Closed: c.closed, Generation: c.connGen})
 }
 
 var ErrClientClosed = errors.New("derphttp.Client closed")
