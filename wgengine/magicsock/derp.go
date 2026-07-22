@@ -49,6 +49,15 @@ type derpRoute struct {
 	dc       *derphttp.Client // don't use directly; see comment above
 }
 
+// AuthoritativeDERPRoute identifies a peer whose HomeDERP is authoritative.
+// Generation identifies the control-plane transition that published the
+// route; it must be non-zero.
+type AuthoritativeDERPRoute struct {
+	Peer       key.NodePublic
+	RegionID   int
+	Generation uint64
+}
+
 // removeDerpPeerRoute removes a DERP route entry previously added by addDerpPeerRoute.
 func (c *Conn) removeDerpPeerRoute(peer key.NodePublic, regionID int, dc *derphttp.Client) {
 	c.mu.Lock()
@@ -65,7 +74,22 @@ func (c *Conn) removeDerpPeerRoute(peer key.NodePublic, regionID int, dc *derpht
 func (c *Conn) addDerpPeerRoute(peer key.NodePublic, regionID int, dc *derphttp.Client) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if _, authoritative := c.authoritativeDERPRoutes[peer]; authoritative {
+		return
+	}
 	mak.Set(&c.derpRoute, peer, derpRoute{regionID, dc})
+}
+
+// learnedDERPRouteForPeerLocked returns peer's learned reverse DERP route,
+// unless its network-map route is authoritative.
+//
+// c.mu must be held.
+func (c *Conn) learnedDERPRouteForPeerLocked(peer key.NodePublic) (derpRoute, bool) {
+	if _, authoritative := c.authoritativeDERPRoutes[peer]; authoritative {
+		return derpRoute{}, false
+	}
+	r, ok := c.derpRoute[peer]
+	return r, ok
 }
 
 // fallbackDERPRegionForPeer returns the DERP region ID we might be able to use
@@ -82,24 +106,10 @@ func (c *Conn) addDerpPeerRoute(peer key.NodePublic, regionID int, dc *derphttp.
 func (c *Conn) fallbackDERPRegionForPeer(peer key.NodePublic) (regionID int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if dr, ok := c.derpRoute[peer]; ok {
+	if dr, ok := c.learnedDERPRouteForPeerLocked(peer); ok {
 		return dr.regionID
 	}
 	return 0
-}
-
-// InvalidateDERPRouteForPeer discards the learned reverse DERP route for peer.
-//
-// A control plane that has authoritatively moved a peer's receive home must be
-// able to make that new HomeDERP take effect immediately. Learned reverse
-// routes are an optimization for a slow or incomplete control plane; retaining
-// one after an authoritative update would instead override the new home. This
-// method deliberately removes only the cache entry: it does not close any DERP
-// connection, alter the peer set, or affect other peers.
-func (c *Conn) InvalidateDERPRouteForPeer(peer key.NodePublic) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	delete(c.derpRoute, peer)
 }
 
 // activeDerp contains fields for an active DERP connection.
@@ -386,7 +396,7 @@ func (c *Conn) derpWriteChanForRegion(regionID int, peer key.NodePublic) chan de
 	// node in SF to reach us, so we can reply to them using our
 	// SF connection rather than dialing Frankfurt. (Issue 150)
 	if !peer.IsZero() {
-		if r, ok := c.derpRoute[peer]; ok {
+		if r, ok := c.learnedDERPRouteForPeerLocked(peer); ok {
 			if ad, ok := c.activeDerp[r.regionID]; ok && ad.c == r.dc {
 				c.setPeerLastDerpLocked(peer, r.regionID, regionID)
 				*ad.lastWrite = time.Now()

@@ -378,6 +378,10 @@ type Conn struct {
 	// creating a new DERP connection back to their home.
 	derpRoute map[key.NodePublic]derpRoute
 
+	// authoritativeDERPRoutes contains peers whose network-map HomeDERP must
+	// not be overridden by a learned reverse DERP route.
+	authoritativeDERPRoutes map[key.NodePublic]AuthoritativeDERPRoute
+
 	// peerLastDerp tracks which DERP node we last used to speak with a
 	// peer. It's only used to quiet logging, so we only log on change.
 	peerLastDerp map[key.NodePublic]int
@@ -2954,7 +2958,8 @@ func (c *candidatePeerRelay) isValid() bool {
 	return !c.nodeKey.IsZero() && !c.discoKey.IsZero()
 }
 
-// SetNetworkMap updates the network map with the given self node and peers.
+// SetNetworkMap updates the network map with the given self node and peers and
+// clears any authoritative DERP route policy.
 // It must be called synchronously from the caller's goroutine to ensure
 // magicsock has the current state before subsequent operations proceed.
 //
@@ -2966,13 +2971,45 @@ func (c *candidatePeerRelay) isValid() bool {
 // initial netmap and for changes to self or to global state (filter, DERP,
 // etc.) that aren't covered by the per-peer methods.
 func (c *Conn) SetNetworkMap(self tailcfg.NodeView, peers []tailcfg.NodeView) {
-	peersChanged := c.updateNodes(self, peers)
+	c.setNetworkMap(self, peers, nil)
+}
+
+// SetNetworkMapWithDERPRoutePolicy updates the network map and atomically
+// replaces the set of peers whose HomeDERP is authoritative. Every route must
+// name a peer in peers with exactly the same non-zero HomeDERP, and must have a
+// non-zero Generation. On validation failure, neither the network map nor the
+// existing policy is changed.
+//
+// Learned reverse DERP routes for authoritative peers are discarded during
+// publication and remain disabled until a later network-map publication omits
+// those peers from the policy. Callers using authoritative routes must use this
+// method for every full network-map publication.
+func (c *Conn) SetNetworkMapWithDERPRoutePolicy(self tailcfg.NodeView, peers []tailcfg.NodeView, routes []AuthoritativeDERPRoute) error {
+	return c.setNetworkMap(self, peers, routes)
+}
+
+func (c *Conn) setNetworkMap(self tailcfg.NodeView, peers []tailcfg.NodeView, routes []AuthoritativeDERPRoute) error {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return nil
+	}
+	authoritativeRoutes, err := validateAuthoritativeDERPRoutes(peers, routes)
+	if err != nil {
+		c.mu.Unlock()
+		return err
+	}
+
+	peersChanged := c.updateNodesLocked(self, peers)
+	c.authoritativeDERPRoutes = authoritativeRoutes
+	for peer := range authoritativeRoutes {
+		delete(c.derpRoute, peer)
+	}
 
 	relayClientEnabled := self.Valid() &&
 		!self.HasCap(tailcfg.NodeAttrDisableRelayClient) &&
 		!self.HasCap(tailcfg.NodeAttrOnlyTCP443)
 
-	c.mu.Lock()
 	relayClientChanged := c.relayClientEnabled != relayClientEnabled
 	c.relayClientEnabled = relayClientEnabled
 	filt := c.filt
@@ -2982,7 +3019,7 @@ func (c *Conn) SetNetworkMap(self tailcfg.NodeView, peers []tailcfg.NodeView) {
 	c.mu.Unlock() // release c.mu before potentially calling c.updateRelayServersSet which is O(m * n)
 
 	if isClosed {
-		return // nothing to do here, the conn is closed and the update is no longer relevant
+		return nil // nothing to do here, the conn is closed and the update is no longer relevant
 	}
 
 	if peersChanged || relayClientChanged {
@@ -2993,14 +3030,55 @@ func (c *Conn) SetNetworkMap(self tailcfg.NodeView, peers []tailcfg.NodeView) {
 			c.updateRelayServersSet(filt, selfView, peersSnap)
 		}
 	}
+	return nil
 }
 
-// updateNodes updates [Conn] to reflect the given self node and peers.
-// It reports whether the peer set (membership or any field) changed.
-func (c *Conn) updateNodes(self tailcfg.NodeView, peers []tailcfg.NodeView) (peersChanged bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+// validateAuthoritativeDERPRoutes validates routes against peers and returns a
+// fresh policy map. The caller must hold c.mu across validation and publication
+// of the returned map.
+func validateAuthoritativeDERPRoutes(peers []tailcfg.NodeView, routes []AuthoritativeDERPRoute) (map[key.NodePublic]AuthoritativeDERPRoute, error) {
+	if len(routes) == 0 {
+		return nil, nil
+	}
 
+	peerHomeDERP := make(map[key.NodePublic]int, len(peers))
+	for _, peer := range peers {
+		if peer.Valid() {
+			peerHomeDERP[peer.Key()] = peer.HomeDERP()
+		}
+	}
+
+	policy := make(map[key.NodePublic]AuthoritativeDERPRoute, len(routes))
+	for _, route := range routes {
+		if route.Peer.IsZero() {
+			return nil, errors.New("authoritative DERP route has zero peer key")
+		}
+		if route.RegionID <= 0 {
+			return nil, fmt.Errorf("authoritative DERP route for %v has invalid region %d", route.Peer.ShortString(), route.RegionID)
+		}
+		if route.Generation == 0 {
+			return nil, fmt.Errorf("authoritative DERP route for %v has zero generation", route.Peer.ShortString())
+		}
+		homeDERP, ok := peerHomeDERP[route.Peer]
+		if !ok {
+			return nil, fmt.Errorf("authoritative DERP route peer %v is not in the network map", route.Peer.ShortString())
+		}
+		if homeDERP != route.RegionID {
+			return nil, fmt.Errorf("authoritative DERP route for %v has region %d; network map HomeDERP is %d", route.Peer.ShortString(), route.RegionID, homeDERP)
+		}
+		if _, duplicate := policy[route.Peer]; duplicate {
+			return nil, fmt.Errorf("duplicate authoritative DERP route for %v", route.Peer.ShortString())
+		}
+		policy[route.Peer] = route
+	}
+	return policy, nil
+}
+
+// updateNodesLocked updates [Conn] to reflect the given self node and peers.
+// It reports whether the peer set (membership or any field) changed.
+//
+// c.mu must be held.
+func (c *Conn) updateNodesLocked(self tailcfg.NodeView, peers []tailcfg.NodeView) (peersChanged bool) {
 	if c.closed {
 		return false
 	}
