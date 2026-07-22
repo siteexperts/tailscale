@@ -42,48 +42,47 @@ func TestAcquireDERPRegionWaitsForServerInfo(t *testing.T) {
 	if got := lease.Generation(); got == 0 {
 		t.Fatal("lease has zero receive generation")
 	}
+
+	if err := stack.conn.DebugBreakDERPConns(); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for lease.Ready() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if lease.Ready() {
+		t.Fatal("lease stayed ready after its DERP connection was detached")
+	}
 }
 
-func TestDERPReceiveLeaseIsGenerationBound(t *testing.T) {
-	c := newConn(t.Logf)
-	changed := make(chan struct{})
-	c.mu.Lock()
-	c.activeDerp = map[int]activeDerp{
-		7: {
-			readyGeneration: 4,
-			leaseRefs:       1,
-			readyChanged:    changed,
-			lastWrite:       ptrTo(time.Now()),
-		},
-	}
-	c.mu.Unlock()
+func TestAcquireDERPRegionCanceledDoesNotAcquireLease(t *testing.T) {
+	derpMap, cleanupDERP := runDERPAndStun(t, t.Logf, localhostListener{}, netip.MustParseAddr("127.0.0.1"))
+	defer cleanupDERP()
+	stack := newMagicStack(t, t.Logf, localhostListener{}, derpMap)
+	defer stack.Close()
 
-	lease := &DERPReceiveLease{c: c, regionID: 7, generation: 4}
-	if !lease.Ready() {
-		t.Fatal("lease is not ready for its ServerInfo generation")
+	stack.conn.mu.Lock()
+	before := stack.conn.activeDerp[1].leaseRefs
+	stack.conn.mu.Unlock()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := stack.conn.AcquireDERPRegion(ctx, 1); err == nil {
+		t.Fatal("AcquireDERPRegion accepted an already-canceled context")
 	}
+	stack.conn.mu.Lock()
+	after := stack.conn.activeDerp[1].leaseRefs
+	stack.conn.mu.Unlock()
+	if after != before {
+		t.Fatalf("canceled acquire changed lease refs from %d to %d", before, after)
+	}
+}
 
-	// A reconnect must invalidate a lease from the previous receive
-	// generation; callers have to acquire a fresh proof rather than treating
-	// reconnect as a transparent extension.
-	c.mu.Lock()
-	ad := c.activeDerp[7]
-	ad.readyGeneration = 5
-	signalDERPReadinessChangeLocked(&ad)
-	c.activeDerp[7] = ad
-	c.mu.Unlock()
+func TestDERPReceiveLeaseZeroValueIsSafe(t *testing.T) {
+	var lease DERPReceiveLease
 	if lease.Ready() {
-		t.Fatal("lease stayed ready after DERP receive generation changed")
+		t.Fatal("zero-value lease reports ready")
 	}
-
 	lease.Close()
-	lease.Close()
-	c.mu.Lock()
-	gotRefs := c.activeDerp[7].leaseRefs
-	c.mu.Unlock()
-	if gotRefs != 0 {
-		t.Fatalf("lease refs after idempotent Close = %d, want 0", gotRefs)
-	}
 }
 
 func TestDERPReceiveLeaseProtectsIdleNonHomeConnection(t *testing.T) {

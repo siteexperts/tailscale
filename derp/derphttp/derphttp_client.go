@@ -217,6 +217,19 @@ func (c *Client) TLSConnectionState() (_ *tls.ConnectionState, ok bool) {
 	return c.tlsState, c.tlsState != nil
 }
 
+// ConnectionGeneration reports whether the client currently owns a live DERP
+// connection and, when it does, that connection's generation. A caller holding
+// a higher-level lock can use this to distinguish a completed handshake on an
+// old connection from the current connection after a send or receive error has
+// detached it for reconnect.
+//
+// The generation is meaningful only while connected is true.
+func (c *Client) ConnectionGeneration() (generation int, connected bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.connGen, !c.closed && c.client != nil
+}
+
 // ServerPublicKey returns the server's public key.
 //
 // It only returns a non-zero value once a connection has succeeded

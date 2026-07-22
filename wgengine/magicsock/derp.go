@@ -160,18 +160,22 @@ func (l *DERPReceiveLease) Generation() int { return l.generation }
 // lease is still DERP-ready. A false result means the caller must re-acquire a
 // lease and must not treat this lease as proof of target reachability.
 func (l *DERPReceiveLease) Ready() bool {
-	if l == nil || l.closed.Load() {
+	if l == nil || l.c == nil || l.dc == nil || l.closed.Load() {
 		return false
 	}
 	l.c.mu.Lock()
 	defer l.c.mu.Unlock()
 	ad, ok := l.c.activeDerp[l.regionID]
-	return ok && ad.c == l.dc && ad.readyGeneration == l.generation && ad.leaseRefs > 0
+	if !ok || ad.c != l.dc || ad.readyGeneration != l.generation || ad.leaseRefs == 0 {
+		return false
+	}
+	generation, connected := l.dc.ConnectionGeneration()
+	return connected && generation == l.generation
 }
 
 // Close releases the reaper hold. It is safe to call more than once.
 func (l *DERPReceiveLease) Close() {
-	if l == nil || !l.closed.CompareAndSwap(false, true) {
+	if l == nil || l.c == nil || !l.closed.CompareAndSwap(false, true) {
 		return
 	}
 	l.c.mu.Lock()
@@ -199,6 +203,9 @@ func (c *Conn) AcquireDERPRegion(ctx context.Context, regionID int) (*DERPReceiv
 	if ctx == nil {
 		return nil, fmt.Errorf("magicsock: nil context acquiring derp-%d", regionID)
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("magicsock: acquiring derp-%d: %w", regionID, err)
+	}
 	if c.derpWriteChanForRegion(regionID, key.NodePublic{}) == nil {
 		return nil, fmt.Errorf("magicsock: cannot connect to derp-%d", regionID)
 	}
@@ -214,6 +221,18 @@ func (c *Conn) AcquireDERPRegion(ctx context.Context, regionID int) (*DERPReceiv
 			return nil, fmt.Errorf("magicsock: derp-%d disappeared while acquiring", regionID)
 		}
 		if ad.readyGeneration != 0 {
+			generation, connected := ad.c.ConnectionGeneration()
+			if !connected || generation != ad.readyGeneration {
+				ad.readyGeneration = 0
+				signalDERPReadinessChangeLocked(&ad)
+				c.activeDerp[regionID] = ad
+				c.mu.Unlock()
+				continue
+			}
+			if err := ctx.Err(); err != nil {
+				c.mu.Unlock()
+				return nil, fmt.Errorf("magicsock: acquiring derp-%d: %w", regionID, err)
+			}
 			ad.leaseRefs++
 			c.activeDerp[regionID] = ad
 			lease := &DERPReceiveLease{c: c, regionID: regionID, dc: ad.c, generation: ad.readyGeneration}
