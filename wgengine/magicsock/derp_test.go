@@ -11,6 +11,7 @@ import (
 	"tailscale.com/net/netcheck"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstest"
+	"tailscale.com/types/key"
 	"tailscale.com/util/eventbus"
 	"tailscale.com/util/eventbus/eventbustest"
 )
@@ -18,6 +19,27 @@ import (
 func CheckDERPHeuristicTimes(t *testing.T) {
 	if netcheck.PreferredDERPFrameTime <= frameReceiveRecordRate {
 		t.Errorf("PreferredDERPFrameTime too low; should be at least frameReceiveRecordRate")
+	}
+}
+
+func TestInvalidateDERPRouteForPeer(t *testing.T) {
+	c := newConn(t.Logf)
+	peer := key.NewNode().Public()
+	other := key.NewNode().Public()
+	c.derpRoute = map[key.NodePublic]derpRoute{
+		peer:  {regionID: 900},
+		other: {regionID: 901},
+	}
+
+	if got := c.fallbackDERPRegionForPeer(peer); got != 900 {
+		t.Fatalf("precondition learned route = %d, want 900", got)
+	}
+	c.InvalidateDERPRouteForPeer(peer)
+	if got := c.fallbackDERPRegionForPeer(peer); got != 0 {
+		t.Fatalf("invalidated learned route = %d, want 0", got)
+	}
+	if got := c.fallbackDERPRegionForPeer(other); got != 901 {
+		t.Fatalf("unrelated learned route = %d, want 901", got)
 	}
 }
 

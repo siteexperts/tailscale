@@ -88,6 +88,20 @@ func (c *Conn) fallbackDERPRegionForPeer(peer key.NodePublic) (regionID int) {
 	return 0
 }
 
+// InvalidateDERPRouteForPeer discards the learned reverse DERP route for peer.
+//
+// A control plane that has authoritatively moved a peer's receive home must be
+// able to make that new HomeDERP take effect immediately. Learned reverse
+// routes are an optimization for a slow or incomplete control plane; retaining
+// one after an authoritative update would instead override the new home. This
+// method deliberately removes only the cache entry: it does not close any DERP
+// connection, alter the peer set, or affect other peers.
+func (c *Conn) InvalidateDERPRouteForPeer(peer key.NodePublic) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.derpRoute, peer)
+}
+
 // activeDerp contains fields for an active DERP connection.
 type activeDerp struct {
 	c       *derphttp.Client
