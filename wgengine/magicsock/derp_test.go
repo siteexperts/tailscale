@@ -43,15 +43,14 @@ func TestAcquireDERPRegionWaitsForServerInfo(t *testing.T) {
 		t.Fatal("lease has zero receive generation")
 	}
 
-	if err := stack.conn.DebugBreakDERPConns(); err != nil {
+	stack.conn.mu.Lock()
+	dc := stack.conn.activeDerp[1].c
+	stack.conn.mu.Unlock()
+	if err := dc.Close(); err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.Now().Add(2 * time.Second)
-	for lease.Ready() && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
 	if lease.Ready() {
-		t.Fatal("lease stayed ready after its DERP connection was detached")
+		t.Fatal("lease stayed ready after the DERP client detached its connection")
 	}
 }
 

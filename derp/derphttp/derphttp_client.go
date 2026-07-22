@@ -110,6 +110,11 @@ type ConnectedState struct {
 	Connected  bool
 	Connecting bool
 	Closed     bool
+	// Generation is the current (or most recently disconnected) connection
+	// generation. It is meaningful only with Connected=true for reachability
+	// checks, but retaining it across disconnects makes state transitions
+	// observable without taking Client.mu.
+	Generation int
 	LocalAddr  netip.AddrPort // if Connected
 }
 
@@ -218,16 +223,14 @@ func (c *Client) TLSConnectionState() (_ *tls.ConnectionState, ok bool) {
 }
 
 // ConnectionGeneration reports whether the client currently owns a live DERP
-// connection and, when it does, that connection's generation. A caller holding
-// a higher-level lock can use this to distinguish a completed handshake on an
-// old connection from the current connection after a send or receive error has
-// detached it for reconnect.
+// connection and, when it does, that connection's generation. It reads the
+// client's atomic state and never takes Client.mu, so callers holding a
+// higher-level lock do not block connection, reconnect, or shutdown work.
 //
 // The generation is meaningful only while connected is true.
 func (c *Client) ConnectionGeneration() (generation int, connected bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.connGen, !c.closed && c.client != nil
+	st := c.atomicState.Load()
+	return st.Generation, st.Connected && !st.Closed
 }
 
 // ServerPublicKey returns the server's public key.
@@ -351,10 +354,10 @@ func (c *Client) connect(ctx context.Context, caller string) (client *derp.Clien
 	if c.client != nil {
 		return c.client, c.connGen, nil
 	}
-	c.atomicState.Store(ConnectedState{Connecting: true})
+	c.atomicState.Store(ConnectedState{Connecting: true, Generation: c.connGen})
 	defer func() {
 		if err != nil {
-			c.atomicState.Store(ConnectedState{Connecting: false})
+			c.atomicState.Store(ConnectedState{Generation: c.connGen})
 		}
 	}()
 
@@ -591,8 +594,9 @@ func (c *Client) connect(ctx context.Context, caller string) (client *derp.Clien
 
 	localAddr, _ := c.client.LocalAddr()
 	c.atomicState.Store(ConnectedState{
-		Connected: true,
-		LocalAddr: localAddr,
+		Connected:  true,
+		Generation: c.connGen,
+		LocalAddr:  localAddr,
 	})
 	return c.client, c.connGen, nil
 }
@@ -1146,7 +1150,7 @@ func (c *Client) Close() error {
 	if c.netConn != nil {
 		c.netConn.Close()
 	}
-	c.atomicState.Store(ConnectedState{Closed: true})
+	c.atomicState.Store(ConnectedState{Closed: true, Generation: c.connGen})
 	return nil
 }
 
@@ -1171,6 +1175,7 @@ func (c *Client) closeForReconnect(brokenClient *derp.Client) {
 		c.netConn = nil
 	}
 	c.client = nil
+	c.atomicState.Store(ConnectedState{Generation: c.connGen})
 }
 
 var ErrClientClosed = errors.New("derphttp.Client closed")
