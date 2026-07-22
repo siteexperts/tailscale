@@ -13,6 +13,7 @@ import (
 	"net/netip"
 	"reflect"
 	"slices"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -122,6 +123,121 @@ type activeDerp struct {
 	// It is always non-nil and initialized to a non-zero Time.
 	lastWrite  *time.Time
 	createTime time.Time
+
+	// readyGeneration is the DERP client's receive generation which has
+	// completed the ServerInfo handshake. It is zero until that handshake and
+	// is reset whenever RecvDetail reports a broken connection.
+	readyGeneration int
+	// leaseRefs prevents the idle reaper from closing a non-home connection
+	// while a caller is deliberately using it for a bounded handoff.
+	leaseRefs int
+	// readyChanged is closed whenever readiness, generation, or ownership
+	// changes. It is always non-nil while this activeDerp is in activeDerp.
+	readyChanged chan struct{}
+}
+
+// DERPReceiveLease keeps a non-home DERP connection alive while a caller
+// performs a bounded transition. A lease is usable only for the exact receive
+// generation that completed DERP's ServerInfo handshake; a reconnect makes an
+// old lease invalid rather than silently extending it to a new connection.
+//
+// Callers must always call Close. Close is idempotent.
+type DERPReceiveLease struct {
+	c          *Conn
+	regionID   int
+	dc         *derphttp.Client
+	generation int
+	closed     atomic.Bool
+}
+
+// RegionID returns the region held by the lease.
+func (l *DERPReceiveLease) RegionID() int { return l.regionID }
+
+// Generation returns the DERP receive generation proven by ServerInfo.
+func (l *DERPReceiveLease) Generation() int { return l.generation }
+
+// Ready reports whether the exact connection generation acquired by this
+// lease is still DERP-ready. A false result means the caller must re-acquire a
+// lease and must not treat this lease as proof of target reachability.
+func (l *DERPReceiveLease) Ready() bool {
+	if l == nil || l.closed.Load() {
+		return false
+	}
+	l.c.mu.Lock()
+	defer l.c.mu.Unlock()
+	ad, ok := l.c.activeDerp[l.regionID]
+	return ok && ad.c == l.dc && ad.readyGeneration == l.generation && ad.leaseRefs > 0
+}
+
+// Close releases the reaper hold. It is safe to call more than once.
+func (l *DERPReceiveLease) Close() {
+	if l == nil || !l.closed.CompareAndSwap(false, true) {
+		return
+	}
+	l.c.mu.Lock()
+	defer l.c.mu.Unlock()
+	ad, ok := l.c.activeDerp[l.regionID]
+	if !ok || ad.c != l.dc || ad.leaseRefs == 0 {
+		return
+	}
+	ad.leaseRefs--
+	l.c.activeDerp[l.regionID] = ad
+	if l.regionID != l.c.myDerp && ad.leaseRefs == 0 {
+		l.c.scheduleCleanStaleDerpLocked()
+	}
+}
+
+// AcquireDERPRegion waits until regionID has completed a DERP ServerInfo
+// handshake, then holds that exact connection generation against idle cleanup.
+// It returns an error without acquiring a lease when the region is unavailable,
+// the network is down, or ctx expires.
+//
+// This is intentionally separate from normal packet routing: it is for a
+// controller that needs explicit target-reachability evidence before making a
+// durable routing decision.
+func (c *Conn) AcquireDERPRegion(ctx context.Context, regionID int) (*DERPReceiveLease, error) {
+	if ctx == nil {
+		return nil, fmt.Errorf("magicsock: nil context acquiring derp-%d", regionID)
+	}
+	if c.derpWriteChanForRegion(regionID, key.NodePublic{}) == nil {
+		return nil, fmt.Errorf("magicsock: cannot connect to derp-%d", regionID)
+	}
+	for {
+		c.mu.Lock()
+		if c.closed {
+			c.mu.Unlock()
+			return nil, fmt.Errorf("magicsock: closed while acquiring derp-%d", regionID)
+		}
+		ad, ok := c.activeDerp[regionID]
+		if !ok {
+			c.mu.Unlock()
+			return nil, fmt.Errorf("magicsock: derp-%d disappeared while acquiring", regionID)
+		}
+		if ad.readyGeneration != 0 {
+			ad.leaseRefs++
+			c.activeDerp[regionID] = ad
+			lease := &DERPReceiveLease{c: c, regionID: regionID, dc: ad.c, generation: ad.readyGeneration}
+			c.mu.Unlock()
+			return lease, nil
+		}
+		changed := ad.readyChanged
+		c.mu.Unlock()
+
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("magicsock: acquiring derp-%d: %w", regionID, ctx.Err())
+		case <-changed:
+		}
+	}
+}
+
+// signalDERPReadinessChangeLocked wakes waiters after changing an active
+// connection's readiness, receive generation, or ownership.
+//
+// c.mu must be held.
+func signalDERPReadinessChangeLocked(ad *activeDerp) {
+	close(ad.readyChanged)
+	ad.readyChanged = make(chan struct{})
 }
 
 var (
@@ -456,6 +572,7 @@ func (c *Conn) derpWriteChanForRegion(regionID int, peer key.NodePublic) chan de
 	ad.lastWrite = new(time.Time)
 	*ad.lastWrite = time.Now()
 	ad.createTime = time.Now()
+	ad.readyChanged = make(chan struct{})
 	c.activeDerp[regionID] = ad
 	metricNumDERPConns.Set(int64(len(c.activeDerp)))
 	c.logActiveDerpLocked()
@@ -585,6 +702,13 @@ func (c *Conn) runDerpReader(ctx context.Context, regionID int, dc *derphttp.Cli
 	for {
 		msg, connGen, err := dc.RecvDetail()
 		if err != nil {
+			c.mu.Lock()
+			if ad, ok := c.activeDerp[regionID]; ok && ad.c == dc && ad.readyGeneration != 0 {
+				ad.readyGeneration = 0
+				signalDERPReadinessChangeLocked(&ad)
+				c.activeDerp[regionID] = ad
+			}
+			c.mu.Unlock()
 			c.health.SetDERPRegionConnectedState(regionID, false)
 			// Forget that all these peers have routes.
 			for peer := range peerPresent {
@@ -629,6 +753,13 @@ func (c *Conn) runDerpReader(ctx context.Context, regionID int, dc *derphttp.Cli
 
 		switch m := msg.(type) {
 		case derp.ServerInfoMessage:
+			c.mu.Lock()
+			if ad, ok := c.activeDerp[regionID]; ok && ad.c == dc && ad.readyGeneration != connGen {
+				ad.readyGeneration = connGen
+				signalDERPReadinessChangeLocked(&ad)
+				c.activeDerp[regionID] = ad
+			}
+			c.mu.Unlock()
 			c.health.SetDERPRegionConnectedState(regionID, true)
 			c.health.SetDERPRegionHealth(regionID, "") // until declared otherwise
 			c.logf("magicsock: derp-%d connected; connGen=%v", regionID, connGen)
@@ -975,6 +1106,7 @@ func (c *Conn) closeOrReconnectDERPLocked(regionID int, why string) {
 func (c *Conn) closeDerpLocked(regionID int, why string) {
 	if ad, ok := c.activeDerp[regionID]; ok {
 		c.logf("magicsock: closing connection to derp-%v (%v), age %v", regionID, why, time.Since(ad.createTime).Round(time.Second))
+		signalDERPReadinessChangeLocked(&ad)
 		go ad.c.Close()
 		ad.cancel()
 		delete(c.activeDerp, regionID)
@@ -1022,6 +1154,10 @@ func (c *Conn) cleanStaleDerp() {
 	someNonHomeOpen := false
 	for i, ad := range c.activeDerp {
 		if i == c.myDerp {
+			continue
+		}
+		if ad.leaseRefs > 0 {
+			someNonHomeOpen = true
 			continue
 		}
 		if ad.lastWrite.Before(tooOld) {

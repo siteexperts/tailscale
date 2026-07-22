@@ -4,8 +4,11 @@
 package magicsock
 
 import (
+	"context"
 	"fmt"
+	"net/netip"
 	"testing"
+	"time"
 
 	"tailscale.com/health"
 	"tailscale.com/net/netcheck"
@@ -15,6 +18,99 @@ import (
 	"tailscale.com/util/eventbus"
 	"tailscale.com/util/eventbus/eventbustest"
 )
+
+func TestAcquireDERPRegionWaitsForServerInfo(t *testing.T) {
+	derpMap, cleanupDERP := runDERPAndStun(t, t.Logf, localhostListener{}, netip.MustParseAddr("127.0.0.1"))
+	defer cleanupDERP()
+
+	stack := newMagicStack(t, t.Logf, localhostListener{}, derpMap)
+	defer stack.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	lease, err := stack.conn.AcquireDERPRegion(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Close()
+	if !lease.Ready() {
+		t.Fatal("acquired DERP lease is not ready after ServerInfo")
+	}
+	if got := lease.RegionID(); got != 1 {
+		t.Fatalf("lease region = %d, want 1", got)
+	}
+	if got := lease.Generation(); got == 0 {
+		t.Fatal("lease has zero receive generation")
+	}
+}
+
+func TestDERPReceiveLeaseIsGenerationBound(t *testing.T) {
+	c := newConn(t.Logf)
+	changed := make(chan struct{})
+	c.mu.Lock()
+	c.activeDerp = map[int]activeDerp{
+		7: {
+			readyGeneration: 4,
+			leaseRefs:       1,
+			readyChanged:    changed,
+			lastWrite:       ptrTo(time.Now()),
+		},
+	}
+	c.mu.Unlock()
+
+	lease := &DERPReceiveLease{c: c, regionID: 7, generation: 4}
+	if !lease.Ready() {
+		t.Fatal("lease is not ready for its ServerInfo generation")
+	}
+
+	// A reconnect must invalidate a lease from the previous receive
+	// generation; callers have to acquire a fresh proof rather than treating
+	// reconnect as a transparent extension.
+	c.mu.Lock()
+	ad := c.activeDerp[7]
+	ad.readyGeneration = 5
+	signalDERPReadinessChangeLocked(&ad)
+	c.activeDerp[7] = ad
+	c.mu.Unlock()
+	if lease.Ready() {
+		t.Fatal("lease stayed ready after DERP receive generation changed")
+	}
+
+	lease.Close()
+	lease.Close()
+	c.mu.Lock()
+	gotRefs := c.activeDerp[7].leaseRefs
+	c.mu.Unlock()
+	if gotRefs != 0 {
+		t.Fatalf("lease refs after idempotent Close = %d, want 0", gotRefs)
+	}
+}
+
+func TestDERPReceiveLeaseProtectsIdleNonHomeConnection(t *testing.T) {
+	c := newConn(t.Logf)
+	c.mu.Lock()
+	c.activeDerp = map[int]activeDerp{
+		7: {
+			readyGeneration: 1,
+			leaseRefs:       1,
+			readyChanged:    make(chan struct{}),
+			lastWrite:       ptrTo(time.Now().Add(-2 * derpInactiveCleanupTime)),
+		},
+	}
+	c.mu.Unlock()
+	c.cleanStaleDerp()
+	c.mu.Lock()
+	_, stillActive := c.activeDerp[7]
+	if c.derpCleanupTimer != nil {
+		c.derpCleanupTimer.Stop()
+	}
+	c.mu.Unlock()
+	if !stillActive {
+		t.Fatal("idle reaper closed a non-home DERP connection held by a lease")
+	}
+}
+
+func ptrTo[T any](v T) *T { return &v }
 
 func CheckDERPHeuristicTimes(t *testing.T) {
 	if netcheck.PreferredDERPFrameTime <= frameReceiveRecordRate {
