@@ -188,6 +188,177 @@ func TestAuthoritativeDERPRouteSuppressesRelearn(t *testing.T) {
 	}
 }
 
+func TestAuthoritativeDERPBlockedRouteSuppressesAllDERPFallback(t *testing.T) {
+	c := newConn(t.Logf)
+	peer := key.NewNode().Public()
+	peerView := (&tailcfg.Node{ID: 1, Key: peer, DiscoKey: key.NewDisco().Public()}).View()
+	blocked := AuthoritativeDERPRoute{Peer: peer, Action: DERPRouteBlocked, Generation: 1}
+	if err := c.SetNetworkMapWithDERPRoutePolicy(tailcfg.NodeView{}, []tailcfg.NodeView{peerView}, []AuthoritativeDERPRoute{blocked}); err != nil {
+		t.Fatal(err)
+	}
+
+	// A stale learned entry must not provide a route after an explicit block.
+	c.mu.Lock()
+	c.derpRoute = map[key.NodePublic]derpRoute{peer: {regionID: 901}}
+	if c.authoritativeDERPInboundAllowedLocked(peer) {
+		c.mu.Unlock()
+		t.Fatal("blocked policy accepted inbound DERP")
+	}
+	c.mu.Unlock()
+	if got := c.fallbackDERPRegionForPeer(peer); got != 0 {
+		t.Fatalf("blocked peer fallback DERP region = %d, want 0", got)
+	}
+}
+
+func TestAuthoritativeDERPInboundAllowsCrossRegionAndDeniesBlockedPeers(t *testing.T) {
+	c := newConn(t.Logf)
+	allowedPeer := key.NewNode().Public()
+	blockedPeer := key.NewNode().Public()
+	peers := []tailcfg.NodeView{
+		(&tailcfg.Node{ID: 1, Key: allowedPeer, DiscoKey: key.NewDisco().Public(), HomeDERP: 901}).View(),
+		(&tailcfg.Node{ID: 2, Key: blockedPeer, DiscoKey: key.NewDisco().Public()}).View(),
+	}
+	routes := []AuthoritativeDERPRoute{
+		{Peer: allowedPeer, RegionID: 901, Generation: 1},
+		{Peer: blockedPeer, Action: DERPRouteBlocked, Generation: 1},
+	}
+	if err := c.SetNetworkMapWithDERPRoutePolicy(tailcfg.NodeView{}, peers, routes); err != nil {
+		t.Fatal(err)
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.authoritativeDERPInboundAllowedLocked(allowedPeer) {
+		t.Fatal("authorized peer rejected inbound DERP")
+	}
+	for _, tc := range []struct {
+		name string
+		peer key.NodePublic
+	}{
+		{"blocked peer", blockedPeer},
+		{"unknown peer", key.NewNode().Public()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if c.authoritativeDERPInboundAllowedLocked(tc.peer) {
+				t.Fatal("unauthorized inbound DERP accepted")
+			}
+		})
+	}
+}
+
+func TestLegacySetNetworkMapCannotClearArmedPolicy(t *testing.T) {
+	c := newConn(t.Logf)
+	peer := key.NewNode().Public()
+	armedPeer := (&tailcfg.Node{ID: 1, Key: peer, DiscoKey: key.NewDisco().Public()}).View()
+	blocked := AuthoritativeDERPRoute{Peer: peer, Action: DERPRouteBlocked, Generation: 1}
+	if err := c.SetNetworkMapWithDERPRoutePolicy(tailcfg.NodeView{}, []tailcfg.NodeView{armedPeer}, []AuthoritativeDERPRoute{blocked}); err != nil {
+		t.Fatal(err)
+	}
+
+	// This is the old ambient API. It must be a no-op after arming, even
+	// though the passed peer would otherwise have a usable home.
+	legacyPeer := (&tailcfg.Node{ID: 1, Key: peer, DiscoKey: key.NewDisco().Public(), HomeDERP: 901}).View()
+	c.SetNetworkMap(tailcfg.NodeView{}, []tailcfg.NodeView{legacyPeer})
+	c.mu.Lock()
+	gotPeer := c.peersByID[1]
+	gotRoute, ok := c.authoritativeDERPRoutes[peer]
+	armed := c.authoritativeDERPArmed
+	c.mu.Unlock()
+	if !armed || !ok || gotRoute != blocked {
+		t.Fatalf("legacy call cleared armed policy: armed=%v route=(%+v,%v)", armed, gotRoute, ok)
+	}
+	if got := gotPeer.HomeDERP(); got != 0 {
+		t.Fatalf("legacy call replaced armed peer map HomeDERP=%d, want 0", got)
+	}
+}
+
+func TestAuthoritativeDERPPolicyRejectsGenerationRollback(t *testing.T) {
+	c := newConn(t.Logf)
+	peer := key.NewNode().Public()
+	peerView := (&tailcfg.Node{ID: 1, Key: peer, DiscoKey: key.NewDisco().Public(), HomeDERP: 901}).View()
+	if err := c.SetNetworkMapWithDERPRoutePolicy(tailcfg.NodeView{}, []tailcfg.NodeView{peerView}, []AuthoritativeDERPRoute{{Peer: peer, RegionID: 901, Generation: 2}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.SetNetworkMapWithDERPRoutePolicy(tailcfg.NodeView{}, []tailcfg.NodeView{peerView}, []AuthoritativeDERPRoute{{Peer: peer, RegionID: 901, Generation: 1}}); err == nil {
+		t.Fatal("stale authoritative generation unexpectedly replaced newer policy")
+	}
+	c.mu.Lock()
+	got := c.authoritativeDERPRoutes[peer]
+	c.mu.Unlock()
+	if got.Generation != 2 {
+		t.Fatalf("generation after rejected rollback = %d, want 2", got.Generation)
+	}
+}
+
+func TestAuthoritativeDERPPolicyRejectsSameGenerationEquivocation(t *testing.T) {
+	c := newConn(t.Logf)
+	peer := key.NewNode().Public()
+	via := (&tailcfg.Node{ID: 1, Key: peer, DiscoKey: key.NewDisco().Public(), HomeDERP: 901}).View()
+	if err := c.SetNetworkMapWithDERPRoutePolicy(tailcfg.NodeView{}, []tailcfg.NodeView{via}, []AuthoritativeDERPRoute{{Peer: peer, RegionID: 901, Generation: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	blocked := (&tailcfg.Node{ID: 1, Key: peer, DiscoKey: key.NewDisco().Public()}).View()
+	if err := c.SetNetworkMapWithDERPRoutePolicy(tailcfg.NodeView{}, []tailcfg.NodeView{blocked}, []AuthoritativeDERPRoute{{Peer: peer, Action: DERPRouteBlocked, Generation: 1}}); err == nil {
+		t.Fatal("same-generation route equivocation unexpectedly accepted")
+	}
+}
+
+func TestAuthoritativeDERPPolicyRefusesIncrementalPeerMutation(t *testing.T) {
+	c := newConn(t.Logf)
+	peer := key.NewNode().Public()
+	peerView := (&tailcfg.Node{ID: 1, Key: peer, DiscoKey: key.NewDisco().Public(), HomeDERP: 901}).View()
+	if err := c.SetNetworkMapWithDERPRoutePolicy(tailcfg.NodeView{}, []tailcfg.NodeView{peerView}, []AuthoritativeDERPRoute{{Peer: peer, RegionID: 901, Generation: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	c.RemovePeer(peerView.ID())
+	c.UpsertPeer((&tailcfg.Node{ID: peerView.ID(), Key: peer, DiscoKey: key.NewDisco().Public(), HomeDERP: 902}).View())
+	c.mu.Lock()
+	gotPeer := c.peersByID[peerView.ID()]
+	gotRoute := c.authoritativeDERPRoutes[peer]
+	c.mu.Unlock()
+	if gotPeer.HomeDERP() != 901 || gotRoute.RegionID != 901 || gotRoute.Generation != 1 {
+		t.Fatalf("incremental mutation changed armed policy: peer=%d route=%+v", gotPeer.HomeDERP(), gotRoute)
+	}
+}
+
+func TestAuthoritativeDERPPolicyDropsQueuedInboundAfterWithdrawal(t *testing.T) {
+	c := newConn(t.Logf)
+	peer := key.NewNode().Public()
+	initialPeer := (&tailcfg.Node{ID: 1, Key: peer, DiscoKey: key.NewDisco().Public(), HomeDERP: 901}).View()
+	if err := c.SetNetworkMapWithDERPRoutePolicy(tailcfg.NodeView{}, []tailcfg.NodeView{initialPeer}, []AuthoritativeDERPRoute{{Peer: peer, RegionID: 901, Generation: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	c.mu.Lock()
+	token := c.authoritativeDERPPolicyGeneration
+	c.mu.Unlock()
+
+	// This is the exact state of a frame after runDerpReader authorized and
+	// queued it, before connBind consumes it.
+	released := false
+	queued := derpReadResult{
+		regionID:                      900,
+		src:                           peer,
+		n:                             1,
+		authoritativePolicyGeneration: token,
+		copyBuf: func(dst []byte) int {
+			released = true
+			dst[0] = 0
+			return 1
+		},
+	}
+	withdrawnPeer := (&tailcfg.Node{ID: 1, Key: peer, DiscoKey: key.NewDisco().Public()}).View()
+	if err := c.SetNetworkMapWithDERPRoutePolicy(tailcfg.NodeView{}, []tailcfg.NodeView{withdrawnPeer}, []AuthoritativeDERPRoute{{Peer: peer, Action: DERPRouteBlocked, Generation: 2}}); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 128)
+	if n, _ := c.processDERPReadResult(queued, buf); n != 0 {
+		t.Fatalf("queued frame survived withdrawal: %d bytes", n)
+	}
+	if !released {
+		t.Fatal("withdrawn queued frame did not release the DERP reader")
+	}
+}
+
 func TestSetNetworkMapWithDERPRoutePolicyRejectsInvalidPolicyUnchanged(t *testing.T) {
 	peer := key.NewNode().Public()
 	disco := key.NewDisco().Public()
@@ -208,6 +379,11 @@ func TestSetNetworkMapWithDERPRoutePolicyRejectsInvalidPolicyUnchanged(t *testin
 			name:   "zero region",
 			peers:  []tailcfg.NodeView{initialPeer},
 			routes: []AuthoritativeDERPRoute{{Peer: peer, Generation: 2}},
+		},
+		{
+			name:   "blocked route with region",
+			peers:  []tailcfg.NodeView{initialPeer},
+			routes: []AuthoritativeDERPRoute{{Peer: peer, Action: DERPRouteBlocked, RegionID: 901, Generation: 2}},
 		},
 		{
 			name:   "zero generation",
@@ -254,7 +430,7 @@ func TestSetNetworkMapWithDERPRoutePolicyRejectsInvalidPolicyUnchanged(t *testin
 	}
 }
 
-func TestAuthoritativeDERPRoutePreservesUnrelatedPeers(t *testing.T) {
+func TestAuthoritativeDERPPolicyRequiresCompletePeerCoverage(t *testing.T) {
 	c := newConn(t.Logf)
 	authoritativePeer := key.NewNode().Public()
 	otherPeer := key.NewNode().Public()
@@ -270,19 +446,14 @@ func TestAuthoritativeDERPRoutePreservesUnrelatedPeers(t *testing.T) {
 	}
 	c.mu.Unlock()
 
-	if err := c.SetNetworkMapWithDERPRoutePolicy(tailcfg.NodeView{}, peers, []AuthoritativeDERPRoute{{Peer: authoritativePeer, RegionID: 901, Generation: 1}}); err != nil {
-		t.Fatal(err)
+	if err := c.SetNetworkMapWithDERPRoutePolicy(tailcfg.NodeView{}, peers, []AuthoritativeDERPRoute{{Peer: authoritativePeer, RegionID: 901, Generation: 1}}); err == nil {
+		t.Fatal("partial authoritative policy unexpectedly succeeded")
 	}
-	if got := c.fallbackDERPRegionForPeer(authoritativePeer); got != 0 {
-		t.Errorf("authoritative peer fallback DERP region = %d, want 0", got)
+	if got := c.fallbackDERPRegionForPeer(authoritativePeer); got != 800 {
+		t.Errorf("rejected policy changed authoritative peer fallback DERP region = %d, want 800", got)
 	}
 	if got := c.fallbackDERPRegionForPeer(otherPeer); got != 801 {
-		t.Errorf("unrelated peer fallback DERP region = %d, want 801", got)
-	}
-
-	c.addDerpPeerRoute(otherPeer, 802, nil)
-	if got := c.fallbackDERPRegionForPeer(otherPeer); got != 802 {
-		t.Errorf("unrelated peer relearned DERP region = %d, want 802", got)
+		t.Errorf("rejected policy changed other peer fallback DERP region = %d, want 801", got)
 	}
 }
 

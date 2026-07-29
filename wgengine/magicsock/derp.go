@@ -50,11 +50,27 @@ type derpRoute struct {
 	dc       *derphttp.Client // don't use directly; see comment above
 }
 
-// AuthoritativeDERPRoute identifies a peer whose HomeDERP is authoritative.
-// Generation identifies the control-plane transition that published the
-// route; it must be non-zero.
+// AuthoritativeDERPRouteAction selects the only DERP behavior permitted for a
+// peer after an authoritative policy is armed. The zero value preserves the
+// original route construction for existing fork consumers.
+type AuthoritativeDERPRouteAction uint8
+
+const (
+	// DERPRouteViaRegion permits DERP only through RegionID.
+	DERPRouteViaRegion AuthoritativeDERPRouteAction = iota
+	// DERPRouteBlocked permits direct endpoints but denies all DERP fallback.
+	// It is used on expiry, withdrawal, and an uncertain transition; callers
+	// must not approximate it by clearing a network map, which would restore
+	// ambient/home and learned-route behavior.
+	DERPRouteBlocked
+)
+
+// AuthoritativeDERPRoute identifies a peer whose DERP behavior is
+// authoritative. Generation identifies the control-plane transition that
+// published the route; it must be non-zero.
 type AuthoritativeDERPRoute struct {
 	Peer       key.NodePublic
+	Action     AuthoritativeDERPRouteAction
 	RegionID   int
 	Generation uint64
 }
@@ -79,6 +95,48 @@ func (c *Conn) addDerpPeerRoute(peer key.NodePublic, regionID int, dc *derphttp.
 		return
 	}
 	mak.Set(&c.derpRoute, peer, derpRoute{regionID, dc})
+}
+
+// authoritativeDERPInboundAllowedLocked reports whether a received DERP
+// packet is permitted by the currently armed policy. A peer's authoritative
+// HomeDERP selects where we send *to* that peer; it does not name the local
+// receive region on which that peer's packets arrive. Therefore inbound
+// admission is peer/action-only, while an explicit block remains direct-only.
+// c.mu must be held.
+func (c *Conn) authoritativeDERPInboundAllowedLocked(peer key.NodePublic) bool {
+	if !c.authoritativeDERPArmed {
+		return true
+	}
+	route, ok := c.authoritativeDERPRoutes[peer]
+	return ok && route.Action == DERPRouteViaRegion
+}
+
+// authoritativeDERPWriteAllowedLocked validates an outbound DERP write under
+// the currently published policy. c.mu must be held.
+func (c *Conn) authoritativeDERPWriteAllowedLocked(peer key.NodePublic, regionID int, generation uint64) bool {
+	if !c.authoritativeDERPArmed {
+		return true
+	}
+	route, ok := c.authoritativeDERPRoutes[peer]
+	return ok && route.Action == DERPRouteViaRegion && route.RegionID == regionID && generation == c.authoritativeDERPPolicyGeneration
+}
+
+func (c *Conn) authoritativeDERPWriteAllowed(peer key.NodePublic, regionID int, generation uint64) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.authoritativeDERPWriteAllowedLocked(peer, regionID, generation)
+}
+
+func (c *Conn) authoritativeDERPPolicyToken(peer key.NodePublic, regionID int) (uint64, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.authoritativeDERPArmed {
+		return 0, true
+	}
+	if !c.authoritativeDERPWriteAllowedLocked(peer, regionID, c.authoritativeDERPPolicyGeneration) {
+		return 0, false
+	}
+	return c.authoritativeDERPPolicyGeneration, true
 }
 
 // learnedDERPRouteForPeerLocked returns peer's learned reverse DERP route,
@@ -502,6 +560,9 @@ func (c *Conn) derpWriteChanForRegion(regionID int, peer key.NodePublic) chan de
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if !peer.IsZero() && !c.authoritativeDERPWriteAllowedLocked(peer, regionID, c.authoritativeDERPPolicyGeneration) {
+		return nil
+	}
 	if !c.wantDerpLocked() || c.closed {
 		return nil
 	}
@@ -530,7 +591,7 @@ func (c *Conn) derpWriteChanForRegion(regionID int, peer key.NodePublic) chan de
 	// perhaps peer's home is Frankfurt, but they dialed our home DERP
 	// node in SF to reach us, so we can reply to them using our
 	// SF connection rather than dialing Frankfurt. (Issue 150)
-	if !peer.IsZero() {
+	if !peer.IsZero() && !c.authoritativeDERPArmed {
 		if r, ok := c.learnedDERPRouteForPeerLocked(peer); ok {
 			if ad, ok := c.activeDerp[r.regionID]; ok && ad.c == r.dc {
 				c.setPeerLastDerpLocked(peer, r.regionID, regionID)
@@ -685,6 +746,10 @@ type derpReadResult struct {
 	// If copyBuf is nil, that's a signal from the sender to ignore
 	// this message.
 	copyBuf func(dst []byte) int
+	// authoritativePolicyGeneration is the policy observed when the reader
+	// authorized this frame. The bind rechecks it before handing the frame to
+	// WireGuard so a queued frame cannot survive a withdrawal.
+	authoritativePolicyGeneration uint64
 }
 
 // runDerpReader runs in a goroutine for the life of a DERP
@@ -784,6 +849,17 @@ func (c *Conn) runDerpReader(ctx context.Context, regionID int, dc *derphttp.Cli
 			c.logf("magicsock: derp-%d connected; connGen=%v", regionID, connGen)
 			continue
 		case derp.ReceivedPacket:
+			// A peer's HomeDERP is outbound-only. Still, an explicit withdrawal
+			// is direct-only in both directions, including on an already-open
+			// connection. Save the policy token so the bind can reject a frame
+			// queued immediately before a later withdrawal.
+			c.mu.Lock()
+			allowed := c.authoritativeDERPInboundAllowedLocked(m.Source)
+			res.authoritativePolicyGeneration = c.authoritativeDERPPolicyGeneration
+			c.mu.Unlock()
+			if !allowed {
+				continue
+			}
 			pkt = m
 			res.n = len(m.Data)
 			res.src = m.Source
@@ -849,6 +925,57 @@ type derpWriteRequest struct {
 	pubKey  key.NodePublic
 	b       []byte // copied; ownership passed to receiver
 	isDisco bool
+	// authoritativePolicyGeneration is zero for legacy operation. A writer
+	// must revalidate a nonzero token before sending queued data.
+	authoritativePolicyGeneration uint64
+}
+
+type authoritativeDERPSendAttempt struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+	done   chan struct{}
+}
+
+func (c *Conn) beginAuthoritativeDERPSend(peer key.NodePublic, regionID int, generation uint64) (*authoritativeDERPSendAttempt, bool) {
+	c.authoritativeDERPSendMu.Lock()
+	defer c.authoritativeDERPSendMu.Unlock()
+	c.mu.Lock()
+	allowed := c.authoritativeDERPWriteAllowedLocked(peer, regionID, generation)
+	c.mu.Unlock()
+	if !allowed {
+		return nil, false
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	attempt := &authoritativeDERPSendAttempt{ctx: ctx, cancel: cancel, done: make(chan struct{})}
+	if c.authoritativeDERPInflight == nil {
+		c.authoritativeDERPInflight = make(map[*authoritativeDERPSendAttempt]struct{})
+	}
+	c.authoritativeDERPInflight[attempt] = struct{}{}
+	return attempt, true
+}
+
+func (c *Conn) finishAuthoritativeDERPSend(attempt *authoritativeDERPSendAttempt) {
+	c.authoritativeDERPSendMu.Lock()
+	delete(c.authoritativeDERPInflight, attempt)
+	close(attempt.done)
+	c.authoritativeDERPSendMu.Unlock()
+}
+
+// cancelAuthoritativeDERPSendsLocked snapshots and cancels all attempts that
+// started under the policy being replaced. c.authoritativeDERPSendMu is held.
+func (c *Conn) cancelAuthoritativeDERPSendsLocked() []*authoritativeDERPSendAttempt {
+	attempts := make([]*authoritativeDERPSendAttempt, 0, len(c.authoritativeDERPInflight))
+	for attempt := range c.authoritativeDERPInflight {
+		attempts = append(attempts, attempt)
+		attempt.cancel()
+	}
+	return attempts
+}
+
+func waitAuthoritativeDERPSends(attempts []*authoritativeDERPSendAttempt) {
+	for _, attempt := range attempts {
+		<-attempt.done
+	}
 }
 
 // runDerpWriter runs in a goroutine for the life of a DERP
@@ -866,6 +993,26 @@ func (c *Conn) runDerpWriter(ctx context.Context, dc *derphttp.Client, ch <-chan
 		case <-ctx.Done():
 			return
 		case wr := <-ch:
+			if !wr.pubKey.IsZero() {
+				attempt, allowed := c.beginAuthoritativeDERPSend(wr.pubKey, int(wr.addr.Port()), wr.authoritativePolicyGeneration)
+				if !allowed {
+					metricSendDERPErrorChan.Add(1)
+					continue
+				}
+				err := dc.SendContext(attempt.ctx, wr.pubKey, wr.b)
+				c.finishAuthoritativeDERPSend(attempt)
+				if err != nil {
+					c.logf("magicsock: derp.Send(%v): %v", wr.addr, err)
+					metricSendDERPError.Add(1)
+					if !wr.isDisco {
+						c.metrics.outboundPacketsDroppedErrors.Add(1)
+					}
+				} else if !wr.isDisco {
+					c.metrics.outboundPacketsDERPTotal.Add(1)
+					c.metrics.outboundBytesDERPTotal.Add(int64(len(wr.b)))
+				}
+				continue
+			}
 			err := dc.Send(wr.pubKey, wr.b)
 			if err != nil {
 				c.logf("magicsock: derp.Send(%v): %v", wr.addr, err)
@@ -905,6 +1052,19 @@ func (c *connBind) receiveDERP(buffs [][]byte, sizes []int, eps []conn.Endpoint)
 
 func (c *Conn) processDERPReadResult(dm derpReadResult, b []byte) (n int, ep *endpoint) {
 	if dm.copyBuf == nil {
+		return 0, nil
+	}
+	c.mu.Lock()
+	allowed := c.authoritativeDERPInboundAllowedLocked(dm.src)
+	if c.authoritativeDERPArmed && dm.authoritativePolicyGeneration != c.authoritativeDERPPolicyGeneration {
+		allowed = false
+	}
+	c.mu.Unlock()
+	if !allowed {
+		// runDerpReader waits for copyBuf to release this frame before it can
+		// receive another one. Discarding an invalidated queued frame must
+		// still complete that ownership handshake.
+		dm.copyBuf(b)
 		return 0, nil
 	}
 	var regionID int

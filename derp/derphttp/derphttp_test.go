@@ -167,6 +167,80 @@ func TestSendRecv(t *testing.T) {
 	recvNothing(1)
 }
 
+func TestSendContextCanceledBeforeConnect(t *testing.T) {
+	netMon := netmon.NewStatic()
+	c, err := derphttp.NewClient(key.NewNode(), "https://127.0.0.1:1", t.Logf, netMon)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := c.SendContext(ctx, key.NewNode().Public(), []byte("test")); !errors.Is(err, context.Canceled) {
+		t.Fatalf("SendContext with canceled context = %v, want context.Canceled", err)
+	}
+}
+
+func TestSendContextCanceledDuringFlushReconnects(t *testing.T) {
+	serverURL, s, ln := newTestServer(t, key.NewNode())
+	defer s.Close()
+	defer ln.Close()
+	dialed := make(chan memnet.Conn, 2)
+	ln.NewConn = func(network, addr string, maxBuf int) (memnet.Conn, memnet.Conn) {
+		client, server := memnet.NewConn(addr, maxBuf)
+		dialed <- client
+		return client, server
+	}
+	c, err := derphttp.NewClient(key.NewNode(), serverURL, t.Logf, netmon.NewStatic())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.SetURLDialer(ln.Dial)
+	if err := c.Connect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	waitConnect(t, c)
+	first := <-dialed
+	gen1, connected := c.ConnectionGeneration()
+	if !connected {
+		t.Fatal("initial connection is not live")
+	}
+	if err := first.SetWriteBlock(true); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	errc := make(chan error, 1)
+	go func() { errc <- c.SendContext(ctx, key.NewNode().Public(), []byte("blocked")) }()
+	time.Sleep(25 * time.Millisecond)
+	select {
+	case err := <-errc:
+		t.Fatalf("SendContext returned before cancellation: %v", err)
+	default:
+	}
+	cancel()
+	select {
+	case err := <-errc:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("SendContext error = %v, want context.Canceled", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("SendContext remained blocked after cancellation")
+	}
+	if err := c.Send(key.NewNode().Public(), []byte("reconnected")); err != nil {
+		t.Fatalf("send after cancellation: %v", err)
+	}
+	second := <-dialed
+	if second == first {
+		t.Fatal("reconnect reused the closed connection")
+	}
+	gen2, connected := c.ConnectionGeneration()
+	if !connected || gen2 <= gen1 {
+		t.Fatalf("generation after reconnect = (%d, %v), want >%d and live", gen2, connected, gen1)
+	}
+}
+
 func waitConnect(t testing.TB, c *derphttp.Client) {
 	t.Helper()
 	if m, err := c.Recv(); err != nil {

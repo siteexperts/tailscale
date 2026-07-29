@@ -927,14 +927,45 @@ func (c *Client) dialNodeUsingProxy(ctx context.Context, n *tailcfg.DERPNode, pr
 }
 
 func (c *Client) Send(dstKey key.NodePublic, b []byte) error {
-	client, _, err := c.connect(c.newContext(), "derphttp.Client.Send")
+	return c.SendContext(c.newContext(), dstKey, b)
+}
+
+// SendContext sends a packet and interrupts only the connection generation it
+// used when ctx is canceled. Unlike Close, cancellation leaves this client
+// reconnectable for a later send.
+func (c *Client) SendContext(ctx context.Context, dstKey key.NodePublic, b []byte) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	client, _, err := c.connect(ctx, "derphttp.Client.SendContext")
 	if err != nil {
 		return err
 	}
-	if err := client.Send(dstKey, b); err != nil {
+	if err := ctx.Err(); err != nil {
 		c.closeForReconnect(client)
+		return err
 	}
-	return err
+	canceled := make(chan struct{})
+	stop := context.AfterFunc(ctx, func() {
+		c.closeForReconnect(client)
+		close(canceled)
+	})
+	defer func() {
+		if !stop() {
+			<-canceled
+		}
+	}()
+	err = client.Send(dstKey, b)
+	if err != nil {
+		c.closeForReconnect(client)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+	}
+	if err != nil {
+		return err
+	}
+	return ctx.Err()
 }
 
 func (c *Client) registerPing(m derp.PingMessage, ch chan<- bool) {

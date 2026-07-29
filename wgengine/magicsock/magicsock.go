@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/netip"
 	"reflect"
@@ -381,6 +382,26 @@ type Conn struct {
 	// authoritativeDERPRoutes contains peers whose network-map HomeDERP must
 	// not be overridden by a learned reverse DERP route.
 	authoritativeDERPRoutes map[key.NodePublic]AuthoritativeDERPRoute
+	// authoritativeDERPRouteGenerationFloor rejects an in-process stale
+	// authority publication even if it races a newer full network-map update.
+	// The agent maintains the durable cross-restart floor.
+	authoritativeDERPRouteGenerationFloor map[key.NodePublic]uint64
+	// authoritativeDERPRouteFloorPolicy binds an accepted generation to its
+	// exact action/region, so an equal-generation replay cannot equivocate.
+	authoritativeDERPRouteFloorPolicy map[key.NodePublic]AuthoritativeDERPRoute
+	// authoritativeDERPArmed is irreversible for the lifetime of this Conn.
+	// Once a caller has installed an authoritative policy, legacy SetNetworkMap
+	// calls must not clear it and reopen ambient DERP behavior.
+	authoritativeDERPArmed bool
+	// authoritativeDERPPolicyGeneration changes with every accepted
+	// authoritative publication. Queued DERP writes carry this token and are
+	// revalidated by the writer before transmission.
+	authoritativeDERPPolicyGeneration uint64
+	// authoritativeDERPSendMu serializes registration and withdrawal of
+	// cancelable sends. It is never held while a socket write is in progress.
+	// Lock order is authoritativeDERPSendMu then c.mu.
+	authoritativeDERPSendMu   sync.Mutex
+	authoritativeDERPInflight map[*authoritativeDERPSendAttempt]struct{}
 
 	// peerLastDerp tracks which DERP node we last used to speak with a
 	// peer. It's only used to quiet logging, so we only log on change.
@@ -1625,6 +1646,11 @@ func (c *Conn) sendAddr(addr netip.AddrPort, pubKey key.NodePublic, b []byte, is
 		metricSendDERPErrorChan.Add(1)
 		return false, nil
 	}
+	policyToken, allowed := c.authoritativeDERPPolicyToken(pubKey, regionID)
+	if !allowed {
+		metricSendDERPErrorChan.Add(1)
+		return false, nil
+	}
 
 	// TODO(bradfitz): this makes garbage for now; we could use a
 	// buffer pool later.  Previously we passed ownership of this
@@ -1633,7 +1659,7 @@ func (c *Conn) sendAddr(addr netip.AddrPort, pubKey key.NodePublic, b []byte, is
 	// internal locks.
 	pkt := bytes.Clone(b)
 
-	wr := derpWriteRequest{addr, pubKey, pkt, isDisco}
+	wr := derpWriteRequest{addr: addr, pubKey: pubKey, b: pkt, isDisco: isDisco, authoritativePolicyGeneration: policyToken}
 	for range 3 {
 		select {
 		case <-c.donec:
@@ -2971,7 +2997,27 @@ func (c *candidatePeerRelay) isValid() bool {
 // initial netmap and for changes to self or to global state (filter, DERP,
 // etc.) that aren't covered by the per-peer methods.
 func (c *Conn) SetNetworkMap(self tailcfg.NodeView, peers []tailcfg.NodeView) {
-	c.setNetworkMap(self, peers, nil)
+	c.authoritativeDERPSendMu.Lock()
+	c.mu.Lock()
+	armed := c.authoritativeDERPArmed
+	var attempts []*authoritativeDERPSendAttempt
+	if armed {
+		for peer, route := range c.authoritativeDERPRoutes {
+			route.Action = DERPRouteBlocked
+			route.RegionID = 0
+			c.authoritativeDERPRoutes[peer] = route
+		}
+		c.authoritativeDERPPolicyGeneration++
+		attempts = c.cancelAuthoritativeDERPSendsLocked()
+	}
+	c.mu.Unlock()
+	c.authoritativeDERPSendMu.Unlock()
+	waitAuthoritativeDERPSends(attempts)
+	if armed {
+		c.logf("magicsock: legacy SetNetworkMap after authoritative DERP policy; synchronously blocked DERP")
+		return
+	}
+	c.setNetworkMap(self, peers, nil, false)
 }
 
 // SetNetworkMapWithDERPRoutePolicy updates the network map and atomically
@@ -2985,23 +3031,65 @@ func (c *Conn) SetNetworkMap(self tailcfg.NodeView, peers []tailcfg.NodeView) {
 // those peers from the policy. Callers using authoritative routes must use this
 // method for every full network-map publication.
 func (c *Conn) SetNetworkMapWithDERPRoutePolicy(self tailcfg.NodeView, peers []tailcfg.NodeView, routes []AuthoritativeDERPRoute) error {
-	return c.setNetworkMap(self, peers, routes)
+	return c.setNetworkMap(self, peers, routes, true)
 }
 
-func (c *Conn) setNetworkMap(self tailcfg.NodeView, peers []tailcfg.NodeView, routes []AuthoritativeDERPRoute) error {
+func (c *Conn) setNetworkMap(self tailcfg.NodeView, peers []tailcfg.NodeView, routes []AuthoritativeDERPRoute, authoritative bool) error {
+	if authoritative {
+		c.authoritativeDERPSendMu.Lock()
+	}
+	var attempts []*authoritativeDERPSendAttempt
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
+		if authoritative {
+			c.authoritativeDERPSendMu.Unlock()
+		}
 		return nil
 	}
-	authoritativeRoutes, err := validateAuthoritativeDERPRoutes(peers, routes)
-	if err != nil {
-		c.mu.Unlock()
-		return err
+	var authoritativeRoutes map[key.NodePublic]AuthoritativeDERPRoute
+	if authoritative {
+		var err error
+		authoritativeRoutes, err = validateAuthoritativeDERPRoutes(peers, routes)
+		if err != nil {
+			c.mu.Unlock()
+			c.authoritativeDERPSendMu.Unlock()
+			return err
+		}
+		for peer, route := range authoritativeRoutes {
+			if floor := c.authoritativeDERPRouteGenerationFloor[peer]; route.Generation < floor {
+				c.mu.Unlock()
+				c.authoritativeDERPSendMu.Unlock()
+				return fmt.Errorf("authoritative DERP route for %v regresses generation %d below accepted floor %d", peer.ShortString(), route.Generation, floor)
+			} else if route.Generation == floor {
+				accepted, ok := c.authoritativeDERPRouteFloorPolicy[peer]
+				if !ok || accepted != route {
+					c.mu.Unlock()
+					c.authoritativeDERPSendMu.Unlock()
+					return fmt.Errorf("authoritative DERP route for %v equivocates at accepted generation %d", peer.ShortString(), route.Generation)
+				}
+			}
+		}
 	}
 
+	policyChanged := authoritative && (!c.authoritativeDERPArmed || !maps.Equal(c.authoritativeDERPRoutes, authoritativeRoutes))
 	peersChanged := c.updateNodesLocked(self, peers)
 	c.authoritativeDERPRoutes = authoritativeRoutes
+	if authoritative && policyChanged {
+		c.authoritativeDERPArmed = true
+		c.authoritativeDERPPolicyGeneration++
+		if c.authoritativeDERPRouteGenerationFloor == nil {
+			c.authoritativeDERPRouteGenerationFloor = make(map[key.NodePublic]uint64, len(authoritativeRoutes))
+			c.authoritativeDERPRouteFloorPolicy = make(map[key.NodePublic]AuthoritativeDERPRoute, len(authoritativeRoutes))
+		}
+		for peer, route := range authoritativeRoutes {
+			if route.Generation > c.authoritativeDERPRouteGenerationFloor[peer] {
+				c.authoritativeDERPRouteGenerationFloor[peer] = route.Generation
+				c.authoritativeDERPRouteFloorPolicy[peer] = route
+			}
+		}
+		attempts = c.cancelAuthoritativeDERPSendsLocked()
+	}
 	for peer := range authoritativeRoutes {
 		delete(c.derpRoute, peer)
 	}
@@ -3017,6 +3105,10 @@ func (c *Conn) setNetworkMap(self tailcfg.NodeView, peers []tailcfg.NodeView, ro
 	peersSnap := c.peerSnapshotLocked()
 	isClosed := c.closed
 	c.mu.Unlock() // release c.mu before potentially calling c.updateRelayServersSet which is O(m * n)
+	if authoritative {
+		c.authoritativeDERPSendMu.Unlock()
+		waitAuthoritativeDERPSends(attempts)
+	}
 
 	if isClosed {
 		return nil // nothing to do here, the conn is closed and the update is no longer relevant
@@ -3037,10 +3129,6 @@ func (c *Conn) setNetworkMap(self tailcfg.NodeView, peers []tailcfg.NodeView, ro
 // fresh policy map. The caller must hold c.mu across validation and publication
 // of the returned map.
 func validateAuthoritativeDERPRoutes(peers []tailcfg.NodeView, routes []AuthoritativeDERPRoute) (map[key.NodePublic]AuthoritativeDERPRoute, error) {
-	if len(routes) == 0 {
-		return nil, nil
-	}
-
 	peerHomeDERP := make(map[key.NodePublic]int, len(peers))
 	for _, peer := range peers {
 		if peer.Valid() {
@@ -3053,8 +3141,14 @@ func validateAuthoritativeDERPRoutes(peers []tailcfg.NodeView, routes []Authorit
 		if route.Peer.IsZero() {
 			return nil, errors.New("authoritative DERP route has zero peer key")
 		}
-		if route.RegionID <= 0 {
+		if route.Action != DERPRouteViaRegion && route.Action != DERPRouteBlocked {
+			return nil, fmt.Errorf("authoritative DERP route for %v has invalid action %d", route.Peer.ShortString(), route.Action)
+		}
+		if route.Action == DERPRouteViaRegion && route.RegionID <= 0 {
 			return nil, fmt.Errorf("authoritative DERP route for %v has invalid region %d", route.Peer.ShortString(), route.RegionID)
+		}
+		if route.Action == DERPRouteBlocked && route.RegionID != 0 {
+			return nil, fmt.Errorf("blocked authoritative DERP route for %v has region %d", route.Peer.ShortString(), route.RegionID)
 		}
 		if route.Generation == 0 {
 			return nil, fmt.Errorf("authoritative DERP route for %v has zero generation", route.Peer.ShortString())
@@ -3063,13 +3157,19 @@ func validateAuthoritativeDERPRoutes(peers []tailcfg.NodeView, routes []Authorit
 		if !ok {
 			return nil, fmt.Errorf("authoritative DERP route peer %v is not in the network map", route.Peer.ShortString())
 		}
-		if homeDERP != route.RegionID {
+		if route.Action == DERPRouteViaRegion && homeDERP != route.RegionID {
 			return nil, fmt.Errorf("authoritative DERP route for %v has region %d; network map HomeDERP is %d", route.Peer.ShortString(), route.RegionID, homeDERP)
+		}
+		if route.Action == DERPRouteBlocked && homeDERP != 0 {
+			return nil, fmt.Errorf("blocked authoritative DERP route for %v has network map HomeDERP %d", route.Peer.ShortString(), homeDERP)
 		}
 		if _, duplicate := policy[route.Peer]; duplicate {
 			return nil, fmt.Errorf("duplicate authoritative DERP route for %v", route.Peer.ShortString())
 		}
 		policy[route.Peer] = route
+	}
+	if len(policy) != len(peerHomeDERP) {
+		return nil, errors.New("authoritative DERP policy does not cover every network-map peer")
 	}
 	return policy, nil
 }
@@ -3276,6 +3376,11 @@ func (c *Conn) UpsertPeer(n tailcfg.NodeView) {
 		c.mu.Unlock()
 		return
 	}
+	if c.authoritativeDERPArmed {
+		c.mu.Unlock()
+		c.logf("magicsock: refusing incremental UpsertPeer after authoritative DERP policy; require complete policy publication")
+		return
+	}
 	if n.ID() == 0 {
 		c.mu.Unlock()
 		devPanicf("UpsertPeer: node with zero ID")
@@ -3312,6 +3417,11 @@ func (c *Conn) RemovePeer(nid tailcfg.NodeID) {
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
+		return
+	}
+	if c.authoritativeDERPArmed {
+		c.mu.Unlock()
+		c.logf("magicsock: refusing incremental RemovePeer after authoritative DERP policy; require complete policy publication")
 		return
 	}
 	prev, ok := c.peersByID[nid]
