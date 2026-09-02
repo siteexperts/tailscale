@@ -326,7 +326,18 @@ func (c *Conn) goDerpConnect(regionID int) {
 // line into a socket TCP buffer. The challenge at present is that connect and
 // reconnect are in the write path and we don't want to block other write
 // operations on those.
-const derpWriteQueueDepth = 32
+//
+// Roam2Home (r2h/v1.102.2-prod): raised 32 → 256. On a high-RTT relayed
+// upload (57 ms box→DERP), a brief outer-TCP stall overflows a 32-deep
+// drop-oldest queue in ~3.6 ms at 100 Mbps offered load (~8.8 kpps of
+// ~1412–1444 B WG-encapsulated frames); the dropped WG packets surface
+// as INNER-TCP loss (measured 16% live, 2026-08-31) and collapse the
+// customer upload to ~14 Mbps. The upstream comment's bufferbloat
+// concern is bounded: 256 × ~1444 B ≈ 370 KB per active DERP region
+// (~29 ms at line rate), small against the kernel sndbuf behind it, and
+// drop-oldest still bounds the queue. See
+// docs/networking/derp-upload-collapse-fix-2026-09.md in the product repo.
+const derpWriteQueueDepth = 256
 
 // derpWriteChanForRegion returns a channel to which to send DERP packet write
 // requests. It creates a new DERP connection to regionID if necessary.
